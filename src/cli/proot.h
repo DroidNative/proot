@@ -69,6 +69,9 @@ static int handle_option_kill_on_exit(Tracee *tracee, const Cli *cli, const char
 static int handle_option_L(Tracee *tracee, const Cli *cli, const char *value);
 static int handle_option_H(Tracee *tracee, const Cli *cli, const char *value);
 static int handle_option_p(Tracee *tracee, const Cli *cli, const char *value);
+static int handle_option_fat_bind(Tracee *tracee, const Cli *cli, const char *value);
+static int handle_option_fuse(Tracee *tracee, const Cli *cli, const char *value);
+static int handle_option_image(Tracee *tracee, const Cli *cli, const char *value);
 
 static int pre_initialize_bindings(Tracee *, const Cli *, size_t, char *const *, size_t);
 static int post_initialize_exe(Tracee *, const Cli *, size_t, char *const *, size_t);
@@ -243,6 +246,39 @@ Copyright (C) 2015 STMicroelectronics, licensed under GPL v2 or later.",
 	  .description = "Replace hard links with symlinks, pretending they are really hardlinks",
 	  .detail = "\tEmulates hard links with symbolic links when SELinux policies\n\
 \tdo not allow hard links.",
+	},
+	{ .class = "Extension options",
+	  .arguments = {
+		{ .name = "--fat-bind", .separator = '=', .value = "path" },
+		{ .name = NULL, .separator = '\0', .value = NULL } },
+	  .handler = handle_option_fat_bind,
+	  .description = "Like -b, for a volume without POSIX permissions (FAT, Android storage).",
+	  .detail = "\tFiles and directories of the volume are presented as vfat does\n\
+\twith the usual umask: owned by the user, mode 0755, chmod(2)\n\
+\tsucceeds without effect.  Programs on it can run although the\n\
+\thost mounts it noexec.",
+	},
+	{ .class = "Extension options",
+	  .arguments = {
+		{ .name = "--fuse", .separator = '\0', .value = NULL },
+		{ .name = NULL, .separator = '\0', .value = NULL } },
+	  .handler = handle_option_fuse,
+	  .description = "Emulate /dev/fuse and FUSE mounts (read-only).",
+	  .detail = "\tFUSE file-systems (squashfuse of AppImages, archivemount, ...)\n\
+\tare mounted without the kernel's FUSE: PRoot answers the\n\
+\tfile-system daemon and keeps what the guest reads in its\n\
+\ttemporary directory, where programs can run from.",
+	},
+	{ .class = "Extension options",
+	  .arguments = {
+		{ .name = "--image", .separator = '=', .value = "dir:path" },
+		{ .name = NULL, .separator = '\0', .value = NULL } },
+	  .handler = handle_option_image,
+	  .description = "Mount the disk image *dir* (created if empty) at the guest *path*.",
+	  .detail = "\tA disk image is a directory with a SQLite database of all its\n\
+\tfiles, directories, links and their permissions, and the file\n\
+\tcontents under names of their own.  It keeps POSIX semantics\n\
+\ton storage that has none, e.g. a FAT formatted SD card.",
 	},
 	{ .class = "Extension options",
 	  .arguments = {

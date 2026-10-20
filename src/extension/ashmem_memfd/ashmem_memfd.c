@@ -1,5 +1,6 @@
 #if defined(__ANDROID__) || defined(__BIONIC__)
 
+#include <string.h>
 #include <stdlib.h>
 #include <signal.h>
 #include <unistd.h>

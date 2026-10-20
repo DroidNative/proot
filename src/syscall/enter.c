@@ -68,6 +68,7 @@
 #include "ptrace/wait.h"
 #include "syscall/heap.h"
 #include "extension/extension.h"
+#include "extension/dn_storage/dn_storage.h"
 #include "execve/execve.h"
 #include "tracee/tracee.h"
 #include "tracee/reg.h"
@@ -242,6 +243,162 @@ static int guest_canonicalize(Tracee *tracee, const char *user_path,
 }
 
 /**
+ * Return the entry recorded for the O_PATH descriptor @fd of @tracee, or
+ * NULL.  An entry is only trusted while the descriptor still refers to
+ * the host path it was recorded with (descriptor numbers get reused).
+ */
+static struct opath_fd *lookup_opath_fd(Tracee *tracee, int fd)
+{
+	char link[64];
+	char host[PATH_MAX];
+	ssize_t length;
+	size_t i;
+
+	snprintf(link, sizeof(link), "/proc/%d/fd/%d", tracee->pid, fd);
+	length = readlink(link, host, sizeof(host) - 1);
+	if (length <= 0)
+		return NULL;
+	host[length] = '\0';
+
+	for (i = 0; i < OPATH_FDS_MAX; i++) {
+		struct opath_fd *entry = &tracee->opath_fds[i];
+
+		if (entry->fd == fd && entry->guest != NULL && entry->host != NULL
+		    && strcmp(host, entry->host) == 0)
+			return entry;
+	}
+	return NULL;
+}
+
+/**
+ * Guest path the descriptor @fd of @tracee was opened with, if it was
+ * recorded (see lookup_opath_fd()), NULL otherwise.
+ */
+const char *opath_fd_guest_path(Tracee *tracee, int fd)
+{
+	struct opath_fd *entry = lookup_opath_fd(tracee, fd);
+	return entry != NULL ? entry->guest : NULL;
+}
+
+/**
+ * Called at the entry of an open with O_PATH, before the path is
+ * translated: remember the canonical guest path being opened, so that
+ * record_opath_fd() can attach it to the resulting descriptor.
+ */
+static void prepare_opath_fd(Tracee *tracee, int dirfd, const char *user_path)
+{
+	char guest_path[PATH_MAX];
+
+	TALLOC_FREE(tracee->opath_pending);
+
+	if (user_path[0] == '/' || dirfd == AT_FDCWD) {
+		if (guest_canonicalize(tracee, user_path, guest_path) < 0)
+			return;
+	}
+	else {
+		/* Relative to another O_PATH descriptor we know about. */
+		struct opath_fd *base = lookup_opath_fd(tracee, dirfd);
+		if (base == NULL)
+			return;
+		strcpy(guest_path, base->guest);
+		if (canonicalize(tracee, user_path, true, guest_path, 0) < 0)
+			return;
+		chop_finality(guest_path);
+	}
+
+	tracee->opath_pending = talloc_strdup(tracee, guest_path);
+	if (tracee->opath_pending != NULL) {
+		tracee->sysexit_pending = true;
+		tracee->restart_how = PTRACE_SYSCALL;
+	}
+}
+
+/**
+ * Called at the exit of an open: attach the guest path saved by
+ * prepare_opath_fd() to the new descriptor @fd (negative on error).
+ */
+void record_opath_fd(Tracee *tracee, int fd)
+{
+	struct opath_fd *entry;
+	char link[64];
+	char host[PATH_MAX];
+	ssize_t length;
+
+	if (tracee->opath_pending == NULL)
+		return;
+	if (fd < 0) {
+		TALLOC_FREE(tracee->opath_pending);
+		return;
+	}
+
+	snprintf(link, sizeof(link), "/proc/%d/fd/%d", tracee->pid, fd);
+	length = readlink(link, host, sizeof(host) - 1);
+	if (length <= 0) {
+		TALLOC_FREE(tracee->opath_pending);
+		return;
+	}
+	host[length] = '\0';
+
+	/* The number may have belonged to another file before.  */
+	for (size_t i = 0; i < OPATH_FDS_MAX; i++) {
+		if (tracee->opath_fds[i].fd == fd)
+			tracee->opath_fds[i].fd = -1;
+	}
+
+	entry = &tracee->opath_fds[tracee->opath_next++ % OPATH_FDS_MAX];
+	TALLOC_FREE(entry->guest);
+	TALLOC_FREE(entry->host);
+	entry->fd = fd;
+	entry->guest = tracee->opath_pending;
+	entry->host = talloc_strdup(tracee, host);
+	tracee->opath_pending = NULL;
+}
+
+/**
+ * bubblewrap >= 0.10 passes "/proc/self/fd/N" magic links of O_PATH
+ * descriptors to mount(2) instead of plain paths.  Resolve such a link
+ * to the host path the descriptor refers to (@host_path) and to its guest
+ * path (@guest_path).  Returns false if @user_path is not such a link.
+ */
+static bool resolve_proc_fd_path(Tracee *tracee, const char *user_path,
+				 char host_path[PATH_MAX], char guest_path[PATH_MAX])
+{
+	struct opath_fd *entry;
+	char link[64];
+	ssize_t length;
+	int consumed = 0;
+	int pid;
+	int fd;
+
+	if (   !(sscanf(user_path, "/proc/self/fd/%d%n", &fd, &consumed) == 1
+		 && user_path[consumed] == '\0')
+	    && !(sscanf(user_path, "/proc/%d/fd/%d%n", &pid, &fd, &consumed) == 2
+		 && user_path[consumed] == '\0'))
+		return false;
+
+	snprintf(link, sizeof(link), "/proc/%d/fd/%d", tracee->pid, fd);
+	length = readlink(link, host_path, PATH_MAX - 1);
+	if (length <= 0)
+		return false;
+	host_path[length] = '\0';
+
+	/* The host path may be reachable through several guest paths (after
+	 * a recursive bind or a pivot_root): prefer the one the descriptor
+	 * was opened with. */
+	entry = lookup_opath_fd(tracee, fd);
+	if (entry != NULL)
+		strcpy(guest_path, entry->guest);
+	else {
+		strcpy(guest_path, host_path);
+		if (detranslate_path(tracee, guest_path, NULL) < 0)
+			return false;
+	}
+	chop_finality(host_path);
+	chop_finality(guest_path);
+	return true;
+}
+
+/**
  * Emulate mount(@src_user, @target_user, @fstype, @flags) by adding a
  * PRoot binding from a host directory to the canonicalized target.
  * Bind mounts use the translated source; "proc"/"sysfs" use the
@@ -249,20 +406,28 @@ static int guest_canonicalize(Tracee *tracee, const char *user_path,
  * empty directory.  Any other case is silently ignored: the caller
  * will still see the syscall succeed (we always void it).
  */
-static void emulate_mount(Tracee *tracee, const char *src_user,
-			  const char *target_user, const char *fstype,
-			  unsigned long flags)
+static int emulate_mount(Tracee *tracee, const char *src_user,
+			 const char *target_user, const char *fstype,
+			 unsigned long flags, const char *data)
 {
 	char host_path[PATH_MAX];
 	char guest_path[PATH_MAX];
+	char src_guest[PATH_MAX];
+	bool have_src_guest = false;
 	const char *tmpdir;
+	int status;
 
 	if ((flags & MS_REMOUNT) != 0)
-		return;
+		return 0;
 
 	if ((flags & MS_BIND) != 0) {
-		if (translate_path(tracee, host_path, AT_FDCWD, src_user, true) < 0)
-			return;
+		if (resolve_proc_fd_path(tracee, src_user, host_path, src_guest))
+			have_src_guest = true;
+		else {
+			if (translate_path(tracee, host_path, AT_FDCWD, src_user, true) < 0)
+				return 0;
+			have_src_guest = guest_canonicalize(tracee, src_user, src_guest) >= 0;
+		}
 	}
 	else if (strcmp(fstype, "proc") == 0)
 		strcpy(host_path, "/proc");
@@ -272,22 +437,110 @@ static void emulate_mount(Tracee *tracee, const char *src_user,
 		strcpy(host_path, "/dev");
 	else if (strcmp(fstype, "devpts") == 0)
 		strcpy(host_path, "/dev/pts");
+	/* FUSE file-systems and disk images (extension/dn_storage).  */
+	else if ((status = dn_storage_mount(tracee, src_user, fstype, data, host_path)) != 0) {
+		if (status < 0)
+			return status;
+	}
 	else if (strcmp(fstype, "tmpfs") == 0) {
 		tmpdir = create_temp_directory(tracee->fs, "proot-tmpfs-");
 		if (tmpdir == NULL)
-			return;
+			return 0;
 		strncpy(host_path, tmpdir, PATH_MAX - 1);
 		host_path[PATH_MAX - 1] = '\0';
 	}
 	else
-		return;
+		return 0;
 
 	chop_finality(host_path);
 
-	if (guest_canonicalize(tracee, target_user, guest_path) < 0)
-		return;
+	char target_host[PATH_MAX];
+
+	if (!resolve_proc_fd_path(tracee, target_user, target_host, guest_path)
+	    && guest_canonicalize(tracee, target_user, guest_path) < 0) {
+		VERBOSE(tracee, 1, "mount: cannot canonicalize target %s", target_user);
+		return -ENOENT;
+	}
+
+	VERBOSE(tracee, 1, "mount: %s -> %s (host %s, guest %s, flags 0x%lx)",
+		src_user, target_user, host_path, guest_path, flags);
+
+	/* A mount hides what was mounted at and below its target: drop the
+	 * bindings at and below the target's guest path, or e.g. PRoot's own
+	 * /dev/stdin binding would show through a tmpfs the tracee mounts
+	 * on /dev ("bwrap --dev").  Not for a self bind (bubblewrap turns its
+	 * new root into a mount point that way).  */
+	if (!(have_src_guest && strcmp(src_guest, guest_path) == 0)) {
+		size_t target_len = strcmp(guest_path, "/") == 0 ? 0 : strlen(guest_path);
+		Binding *iter = CIRCLEQ_FIRST(tracee->fs->bindings.guest);
+
+		while (iter != (void *) tracee->fs->bindings.guest) {
+			Binding *next = CIRCLEQ_NEXT(iter, link.guest);
+			const char *sub = iter->guest.path;
+
+			/* Below the target, or an older binding at the target
+			 * itself, which the new mount replaces.  */
+			if (   target_len > 0
+			    && strncmp(sub, guest_path, target_len) == 0
+			    && (   sub[target_len] == '\0'
+				|| (sub[target_len] == '/' && sub[target_len + 1] != '\0')))
+				remove_binding_from_all_lists(tracee, iter);
+			iter = next;
+		}
+	}
+
+	/* A recursive bind carries the mounts below the source along: do the
+	 * same with the bindings below the source's guest path, otherwise
+	 * e.g. "bwrap --bind / /" would lose /dev, /proc and /sys.  Collect
+	 * first, inserting while walking the list is not safe. */
+	if (   (flags & MS_BIND) != 0 && (flags & MS_REC) != 0 && have_src_guest
+	    && strcmp(src_guest, guest_path) != 0) {
+		size_t src_len = strcmp(src_guest, "/") == 0 ? 0 : strlen(src_guest);
+		size_t count = 0;
+		size_t i;
+		Binding *iter;
+		Binding **snapshot;
+
+		for (iter = CIRCLEQ_FIRST(tracee->fs->bindings.guest);
+		     iter != (void *) tracee->fs->bindings.guest;
+		     iter = CIRCLEQ_NEXT(iter, link.guest))
+			count++;
+
+		snapshot = talloc_array(tracee->ctx, Binding *, count);
+		if (snapshot != NULL) {
+			i = 0;
+			for (iter = CIRCLEQ_FIRST(tracee->fs->bindings.guest);
+			     iter != (void *) tracee->fs->bindings.guest && i < count;
+			     iter = CIRCLEQ_NEXT(iter, link.guest))
+				snapshot[i++] = iter;
+
+			for (i = 0; i < count; i++) {
+				const char *sub = snapshot[i]->guest.path;
+				char moved[PATH_MAX];
+
+				/* Strictly below the source...  */
+				if (   strncmp(sub, src_guest, src_len) != 0
+				    || sub[src_len] != '/' || sub[src_len + 1] == '\0')
+					continue;
+				/* ... and not the target itself or below it.  */
+				if (   strncmp(sub, guest_path, strlen(guest_path)) == 0
+				    && (   sub[strlen(guest_path)] == '/'
+					|| sub[strlen(guest_path)] == '\0'))
+					continue;
+
+				if ((size_t) snprintf(moved, sizeof(moved), "%s%s",
+						      strcmp(guest_path, "/") == 0 ? "" : guest_path,
+						      sub + src_len) >= sizeof(moved))
+					continue;
+				(void) insort_binding3(tracee, tracee->fs,
+						       snapshot[i]->host.path, moved);
+			}
+			talloc_free(snapshot);
+		}
+	}
 
 	(void) insort_binding3(tracee, tracee->fs, host_path, guest_path);
+	return 0;
 }
 
 /**
@@ -310,6 +563,9 @@ static void emulate_pivot_root(Tracee *tracee, const char *new_root_user,
 	size_t put_old_len = 0;
 	char put_old_after[PATH_MAX];
 	bool have_put_old = false;
+	const char *l2s_dir;
+	char l2s_host[PATH_MAX];
+	bool have_l2s = false;
 	size_t count = 0;
 	size_t i;
 	Binding *iter;
@@ -335,6 +591,20 @@ static void emulate_pivot_root(Tracee *tracee, const char *new_root_user,
 		return;
 	strncpy(old_root_host, root_binding->host.path, PATH_MAX - 1);
 	old_root_host[PATH_MAX - 1] = '\0';
+
+	/* Hard links emulated by --link2symlink are symbolic links to host
+	 * paths in PROOT_L2S_DIR, which canonicalization maps back through
+	 * the bindings.  A sandbox built by the tracee (bubblewrap, Flatpak)
+	 * does not mount that directory, which would leave every emulated
+	 * hard link of e.g. an OSTree checkout dangling.  Bind it at a fixed
+	 * place in every new root; the name only has to exist for the
+	 * canonicalization, tracees never look it up themselves.  */
+	l2s_dir = getenv("PROOT_L2S_DIR");
+	if (l2s_dir != NULL && l2s_dir[0] == '/' && strlen(l2s_dir) < PATH_MAX) {
+		strcpy(l2s_host, l2s_dir);
+		chop_finality(l2s_host);
+		have_l2s = true;
+	}
 
 	new_root_len = strlen(new_root_guest);
 
@@ -375,6 +645,9 @@ static void emulate_pivot_root(Tracee *tracee, const char *new_root_user,
 	/* Switch the root over to new_root and expose the previous root at
 	 * put_old, so the tracee can still reach it (bubblewrap accesses
 	 * everything via "/oldroot" right after the pivot). */
+	VERBOSE(tracee, 1, "pivot_root: %s (host %s, guest %s) old %s at %s",
+		new_root_user, new_root_host, new_root_guest, old_root_host,
+		have_put_old ? put_old_after : "(none)");
 	remove_binding_from_all_lists(tracee, root_binding);
 	(void) insort_binding3(tracee, tracee->fs, new_root_host, "/");
 	if (have_put_old)
@@ -388,6 +661,17 @@ static void emulate_pivot_root(Tracee *tracee, const char *new_root_user,
 			continue;
 
 		blen = strlen(b->guest.path);
+
+		/* The mount that becomes the new root moves to "/" with the
+		 * pivot, as in the kernel: it must not stay over its old place
+		 * below put_old, where it would hide what is underneath.
+		 * bubblewrap mounts a tmpfs over /tmp, pivots into it and then
+		 * opens bind sources such as the X11 socket through
+		 * /oldroot/tmp.  */
+		if (strcmp(b->guest.path, new_root_guest) == 0) {
+			remove_binding_from_all_lists(tracee, b);
+			continue;
+		}
 
 		/* Bindings that live under the new root move *with* the pivot:
 		 * "/newroot/usr" becomes "/usr".  Without this, the tracee's
@@ -408,9 +692,11 @@ static void emulate_pivot_root(Tracee *tracee, const char *new_root_user,
 			continue;
 		}
 
-		/* Everything else belonged to the previous root tree;
-		 * re-expose it under put_old (skipping what already sits
-		 * there) and keep the original in place. */
+		/* Everything else belonged to the previous root tree: like
+		 * the kernel, move it below put_old, or drop it when the
+		 * old root is not exposed at all (pivot_root(".", ".")).
+		 * What the new root needs was put there by the tracee's own
+		 * (recursive) bind mounts, see emulate_mount(). */
 		if (have_put_old) {
 			char aliased[PATH_MAX];
 
@@ -421,13 +707,15 @@ static void emulate_pivot_root(Tracee *tracee, const char *new_root_user,
 
 			if ((size_t) snprintf(aliased, sizeof(aliased), "%s%s",
 					      put_old_after, b->guest.path)
-			    >= sizeof(aliased))
-				continue;
-
-			(void) insort_binding3(tracee, tracee->fs,
-					       b->host.path, aliased);
+			    < sizeof(aliased))
+				(void) insort_binding3(tracee, tracee->fs,
+						       b->host.path, aliased);
 		}
+		remove_binding_from_all_lists(tracee, b);
 	}
+
+	if (have_l2s)
+		(void) insort_binding3(tracee, tracee->fs, l2s_host, "/.l2s");
 
 	talloc_free(snapshot);
 }
@@ -462,6 +750,7 @@ static void emulate_umount(Tracee *tracee, const char *target_user)
 	if (strcmp(binding->guest.path, guest_path) != 0)
 		return;
 
+	dn_storage_unmounted(binding->host.path);
 	remove_binding_from_all_lists(tracee, binding);
 }
 
@@ -485,12 +774,14 @@ void apply_emulated_umount(Tracee *tracee)
  * and the SIGSYS handler (Android's parent seccomp filter traps
  * mount, so the syscall never reaches our regular case).
  */
-void apply_emulated_mount(Tracee *tracee)
+int apply_emulated_mount(Tracee *tracee)
 {
 	char src_user[PATH_MAX];
 	char target_user[PATH_MAX];
 	char fstype[256];
+	char data[1024];
 	word_t fstype_addr;
+	word_t data_addr;
 	unsigned long flags;
 
 	fstype[0] = '\0';
@@ -500,16 +791,23 @@ void apply_emulated_mount(Tracee *tracee)
 	fstype[sizeof(fstype) - 1] = '\0';
 
 	if (get_sysarg_path(tracee, src_user, SYSARG_1) < 0)
-		return;
+		return 0;
 	if (get_sysarg_path(tracee, target_user, SYSARG_2) < 0)
-		return;
+		return 0;
 
 	fstype_addr = peek_reg(tracee, CURRENT, SYSARG_3);
 	if (fstype_addr != 0)
 		(void) read_string(tracee, fstype, fstype_addr, sizeof(fstype) - 1);
 	flags = peek_reg(tracee, CURRENT, SYSARG_4);
 
-	emulate_mount(tracee, src_user, target_user, fstype, flags);
+	data[0] = '\0';
+	data[sizeof(data) - 1] = '\0';
+	data_addr = peek_reg(tracee, CURRENT, SYSARG_5);
+	if (data_addr != 0)
+		(void) read_string(tracee, data, data_addr, sizeof(data) - 1);
+
+	tracee->tracks_dir_fds = true;
+	return emulate_mount(tracee, src_user, target_user, fstype, flags, data);
 }
 
 /**
@@ -1798,6 +2096,10 @@ static bool is_proc_userns_file(const char *path)
 
 	if (strncmp(path, "/proc/", 6) != 0)
 		return false;
+	/* Written by "bwrap --disable-userns" (Flatpak) to forbid nested
+	 * user namespaces; there are none to forbid under PRoot.  */
+	if (strcmp(path, "/proc/sys/user/max_user_namespaces") == 0)
+		return true;
 	p = path + 6;
 
 	if (strncmp(p, "self/", 5) == 0)
@@ -1830,7 +2132,92 @@ static void maybe_redirect_userns_file(Tracee *tracee, Reg reg)
 		return;
 	if (!is_proc_userns_file(host_path))
 		return;
+	/* From now on one more user namespace, as "1" would allow.  */
+	if (strcmp(host_path, "/proc/sys/user/max_user_namespaces") == 0) {
+		VERBOSE(tracee, 1, "max_user_namespaces written, limiting unshare");
+		tracee->userns_left = 1;
+	}
 	(void) set_sysarg_path(tracee, "/dev/null", reg);
+}
+
+/**
+ * Result of an emulated unshare(@flags): 0, or -ENOSPC once the tracee
+ * used up the user namespaces it limited itself to (see userns_left).
+ */
+int emulate_unshare(Tracee *tracee, word_t flags)
+{
+	if ((flags & CLONE_NEWNET) != 0)
+		tracee->fake_netns = true;
+
+	VERBOSE(tracee, 1, "unshare(0x%lx), user namespaces left: %d",
+		(unsigned long) flags, tracee->userns_left);
+	if ((flags & CLONE_NEWUSER) != 0 && tracee->userns_left >= 0) {
+		if (tracee->userns_left == 0)
+			return -ENOSPC;
+		tracee->userns_left--;
+	}
+	return 0;
+}
+
+/**
+ * mkdir(2) only gets its parent translated (the new name must not be
+ * probed).  When the directory to create is itself a binding point, e.g.
+ * /dev/shm on Android where the host has no such directory, that would
+ * create it in the parent's host directory instead of reporting EEXIST.
+ * Tell whether @user_path (absolute, or relative to the cwd) names a
+ * binding point, in which case the caller translates the whole path.
+ */
+static bool is_binding_point(Tracee *tracee, int dirfd, const char *user_path)
+{
+	char guest_path[PATH_MAX];
+	const Binding *binding;
+
+	if (user_path[0] == '/' || dirfd == AT_FDCWD) {
+		if (guest_canonicalize(tracee, user_path, guest_path) < 0)
+			return false;
+	}
+	else {
+		/* Relative to a directory descriptor: only when its guest
+		 * path is known for sure (see lookup_opath_fd()).  */
+		const char *base = opath_fd_guest_path(tracee, dirfd);
+		if (base == NULL)
+			return false;
+		strcpy(guest_path, base);
+		if (canonicalize(tracee, user_path, true, guest_path, 0) < 0)
+			return false;
+		chop_finality(guest_path);
+	}
+	binding = get_binding(tracee, GUEST, guest_path);
+	return binding != NULL && strcmp(binding->guest.path, guest_path) == 0
+		&& strcmp(guest_path, "/") != 0;
+}
+
+/**
+ * A bind mount keeps its source alive after the source's name is removed.
+ * bubblewrap relies on that for --bind-data/--file: it writes a temporary
+ * file, bind mounts it and unlinks it right away.  A PRoot binding is only
+ * a path, so such an unlink would break it: tell whether the path in @reg
+ * (already translated) is the host side of a binding, in which case the
+ * caller reports success without removing anything.  The file then lives
+ * until PRoot removes its temporary directories.
+ */
+static bool is_binding_source(Tracee *tracee, Reg reg)
+{
+	char host_path[PATH_MAX];
+	Binding *binding;
+
+	if (get_sysarg_path(tracee, host_path, reg) < 0)
+		return false;
+
+	for (binding = CIRCLEQ_FIRST(tracee->fs->bindings.host);
+	     binding != (void *) tracee->fs->bindings.host;
+	     binding = CIRCLEQ_NEXT(binding, link.host)) {
+		if (strcmp(binding->guest.path, "/") == 0)
+			continue;
+		if (strcmp(binding->host.path, host_path) == 0)
+			return true;
+	}
+	return false;
 }
 
 /**
@@ -2408,11 +2795,12 @@ int translate_syscall_enter(Tracee *tracee)
 	 * be able to configure "its" interfaces (see enter.c netlink
 	 * helpers).  */
 	case PR_unshare:
-		if ((peek_reg(tracee, CURRENT, SYSARG_1) & CLONE_NEWNET) != 0)
-			tracee->fake_netns = true;
+		/* A negative status cancels the syscall and becomes its result. */
+		status = emulate_unshare(tracee, peek_reg(tracee, CURRENT, SYSARG_1));
+		if (status < 0)
+			break;
 		poke_reg(tracee, SYSARG_RESULT, 0);
 		set_sysnum(tracee, PR_void);
-		status = 0;
 		break;
 
 	case PR_setns:
@@ -2427,6 +2815,26 @@ int translate_syscall_enter(Tracee *tracee)
 		poke_reg(tracee, SYSARG_RESULT, 0);
 		set_sysnum(tracee, PR_void);
 		status = 0;
+		break;
+
+	/* The new mount API (open_tree, move_mount, fsopen, mount_setattr,
+	 * ...) is not emulated.  Answer ENOSYS like a pre-5.2 kernel does, so
+	 * callers such as bubblewrap fall back to mount(2), which is.  */
+	case PR_open_tree:
+	case PR_move_mount:
+	case PR_fsopen:
+	case PR_fsconfig:
+	case PR_fsmount:
+	case PR_fspick:
+	case PR_mount_setattr:
+		status = -ENOSYS;
+		break;
+
+	/* fchmodat2 (Linux 6.6) is not translated.  ENOSYS makes the C
+	 * library fall back to its fchmodat emulation, as on older kernels;
+	 * untranslated it fails with ENOENT and breaks package extraction.  */
+	case PR_fchmodat2:
+		status = -ENOSYS;
 		break;
 
 	/* Strip CLONE_NEW* flags from clone(2)/clone3(2) so the
@@ -2484,8 +2892,7 @@ int translate_syscall_enter(Tracee *tracee)
 	 * into PRoot bindings (see emulate_mount/emulate_pivot_root)
 	 * so the resulting paths actually become accessible.  */
 	case PR_mount:
-		apply_emulated_mount(tracee);
-		poke_reg(tracee, SYSARG_RESULT, 0);
+		poke_reg(tracee, SYSARG_RESULT, (word_t) apply_emulated_mount(tracee));
 		set_sysnum(tracee, PR_void);
 		status = 0;
 		break;
@@ -2571,9 +2978,17 @@ int translate_syscall_enter(Tracee *tracee)
 	case PR_lstat:
 	case PR_lstat64:
 	case PR_oldlstat:
-	case PR_unlink:
 	case PR_rmdir:
 		status = translate_sysarg(tracee, SYSARG_1, SYMLINK);
+		break;
+
+	case PR_unlink:
+		status = translate_sysarg(tracee, SYSARG_1, SYMLINK);
+		if (status >= 0 && is_binding_source(tracee, SYSARG_1)) {
+			poke_reg(tracee, SYSARG_RESULT, 0);
+			set_sysnum(tracee, PR_void);
+			status = 0;
+		}
 		break;
 
 	case PR_mkdir:
@@ -2584,7 +2999,10 @@ int translate_syscall_enter(Tracee *tracee)
 		if (status < 0)
 			break;
 
-		status = translate_path2_parent(tracee, AT_FDCWD, path, SYSARG_1);
+		if (is_binding_point(tracee, AT_FDCWD, path))
+			status = translate_path2(tracee, AT_FDCWD, path, SYSARG_1, REGULAR);
+		else
+			status = translate_path2_parent(tracee, AT_FDCWD, path, SYSARG_1);
 		break;
 
 	case PR_linkat:
@@ -2619,7 +3037,9 @@ int translate_syscall_enter(Tracee *tracee)
 		 * open_how struct rather than in a register, so move them into
 		 * SYSARG_3.  The how.resolve flags (RESOLVE_BENEATH, ...) are
 		 * dropped: they reject the absolute host paths PRoot produces,
-		 * and PRoot already keeps path resolution inside the rootfs.  */
+		 * and PRoot already keeps path resolution inside the rootfs.
+		 * Absolute paths under RESOLVE_IN_ROOT/BENEATH are made relative
+		 * to dirfd first (see rebase_openat2_path).  */
 		struct proot_open_how how = {};
 		word_t how_size = peek_reg(tracee, CURRENT, SYSARG_4);
 		if (how_size > sizeof(how))
@@ -2627,6 +3047,16 @@ int translate_syscall_enter(Tracee *tracee)
 		status = read_data(tracee, &how, peek_reg(tracee, CURRENT, SYSARG_3), how_size);
 		if (status < 0)
 			break;
+		status = rebase_openat2_path(tracee, how.resolve);
+		if (status < 0)
+			break;
+		/* RESOLVE_IN_ROOT directory opens are bubblewrap walking to a
+		 * mount point; it only uses the result as a base for *at()
+		 * calls.  O_PATH keeps that working where the directory may
+		 * be traversed but not read, like /dev for Android apps.  */
+		if (   (how.resolve & 0x10) != 0 && (how.flags & O_DIRECTORY) != 0
+		    && (how.flags & (O_ACCMODE | O_PATH | O_CREAT)) == O_RDONLY)
+			how.flags |= O_PATH;
 		set_sysnum(tracee, PR_openat);
 		poke_reg(tracee, SYSARG_3, how.flags);
 		poke_reg(tracee, SYSARG_4, how.mode);
@@ -2640,6 +3070,10 @@ int translate_syscall_enter(Tracee *tracee)
 		status = get_sysarg_path(tracee, path, SYSARG_2);
 		if (status < 0)
 			break;
+
+		if (   (flags & O_PATH) != 0
+		    || (tracee->tracks_dir_fds && (flags & O_DIRECTORY) != 0))
+			prepare_opath_fd(tracee, dirfd, path);
 
 		if (tracee->execfn_addr != 0 && strcmp(path, "/proc/self/auxv") == 0) {
 			tracee->sysexit_pending = true;
@@ -2664,6 +3098,12 @@ int translate_syscall_enter(Tracee *tracee)
 			break;
 
 		status = translate_path2(tracee, dirfd, path, SYSARG_2, SYMLINK);
+		if (   status >= 0 && syscall_number == PR_unlinkat
+		    && is_binding_source(tracee, SYSARG_2)) {
+			poke_reg(tracee, SYSARG_RESULT, 0);
+			set_sysnum(tracee, PR_void);
+			status = 0;
+		}
 		break;
 
 	case PR_mkdirat:
@@ -2675,7 +3115,10 @@ int translate_syscall_enter(Tracee *tracee)
 		if (status < 0)
 			break;
 
-		status = translate_path2_parent(tracee, dirfd, path, SYSARG_2);
+		if (is_binding_point(tracee, dirfd, path))
+			status = translate_path2(tracee, dirfd, path, SYSARG_2, REGULAR);
+		else
+			status = translate_path2_parent(tracee, dirfd, path, SYSARG_2);
 		break;
 
 	case PR_link:
@@ -2897,6 +3340,10 @@ int translate_syscall_enter(Tracee *tracee)
 
 
 end:
+	/* See translate_syscall(): handled again later.  */
+	if (tracee->dn.parked)
+		return 0;
+
 	status2 = notify_extensions(tracee, SYSCALL_ENTER_END, status, 0);
 	if (status2 < 0)
 		status = status2;

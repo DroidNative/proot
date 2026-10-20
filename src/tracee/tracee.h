@@ -297,6 +297,29 @@ typedef struct tracee {
 	 * that don't support prctl(PR_GET_AUXV)). -1 when not active. */
 	int auxv_fd;
 
+	/* Guest paths of the descriptors this tracee opened with O_PATH.
+	 * mount(2) emulation needs them: bubblewrap passes "/proc/self/fd/N"
+	 * as mount source/target, and the host path of such a descriptor
+	 * can be reachable through several guest paths (see enter.c).
+	 * A small ring is enough, the descriptors are used right away. */
+	#define OPATH_FDS_MAX 16
+	struct opath_fd {
+		int fd;                  /* -1 when unused */
+		char *guest;             /* canonical guest path */
+		char *host;              /* host path it referred to */
+	} opath_fds[OPATH_FDS_MAX];
+	unsigned int opath_next;
+	char *opath_pending;         /* guest path of the open in progress */
+	/* Set by the first emulated mount(2): from then on plain directory
+	 * opens are recorded too, bubblewrap walks to its mount targets
+	 * through O_DIRECTORY descriptors (openat2 + RESOLVE_IN_ROOT).  */
+	bool tracks_dir_fds;
+
+	/* User namespaces the tracee may still "create" after it wrote
+	 * /proc/sys/user/max_user_namespaces (bwrap --disable-userns checks
+	 * that the limit works); -1 means unlimited.  */
+	int userns_left;
+
 #ifdef HAS_POKEDATA_WORKAROUND
 	word_t pokedata_workaround_stub_addr;
 	bool pokedata_workaround_cancelled_syscall;
@@ -382,6 +405,34 @@ typedef struct tracee {
 
 	/* List of extensions enabled for this tracee.  */
 	struct extensions *extensions;
+
+	/* DroidNative storage (extension/dn_storage).  "parked": the
+	 * syscall at the current sysenter stop waits for an answer of an
+	 * emulated FUSE file-system; the event loop keeps the tracee
+	 * stopped and handles that stop again with "park_status" once
+	 * the answer is there.  "can_park" is only set while the
+	 * sysenter stage is translated, where nothing was changed yet.  */
+	struct {
+		bool can_park;
+		bool parked;
+		int park_status;
+
+		/* Translate to the shadow of a disk image, not to the
+		 * content files (extension/dn_storage/image.c).  */
+		bool image_raw;
+
+		/* mmap(PROT_EXEC) of a file on a noexec mount, replaced
+		 * with an anonymous mapping filled at the exit stage.  */
+		bool mmap_copy;
+
+		/* open("/dev/fuse") turned into socket() + connect(),
+		 * see extension/dn_storage/fuse.c.  */
+		int fuse_open;
+		int fuse_fd;
+		int fuse_listener;
+		const char *fuse_socket;
+		word_t fuse_address;
+	} dn;
 
 
 	/**********************************************************************

@@ -175,7 +175,17 @@ void translate_syscall(Tracee *tracee)
 		 * chained by PRoot.  */
 		if (tracee->chain.syscalls == NULL) {
 			save_current_regs(tracee, ORIGINAL);
+			tracee->dn.can_park = true;
 			status = translate_syscall_enter(tracee);
+			tracee->dn.can_park = false;
+
+			/* The syscall waits for an emulated FUSE
+			 * file-system: nothing is pushed to the tracee,
+			 * the event loop handles this very stop again
+			 * once the answer is there (extension/dn_storage).  */
+			if (tracee->dn.parked)
+				return;
+
 			save_current_regs(tracee, MODIFIED);
 		}
 		else {
@@ -347,4 +357,34 @@ void translate_syscall(Tracee *tracee)
 	}
 	else
 		print_current_regs(tracee, 4, "sysexit end");
+}
+
+/**
+ * openat2(2) with RESOLVE_IN_ROOT or RESOLVE_BENEATH resolves an absolute
+ * pathname relative to its dirfd, not to "/".  PRoot rewrites openat2()
+ * into openat(), which would resolve it against the guest root, so turn
+ * such a pathname (in SYSARG_2) into a relative one first ("/" -> ".").
+ * Used by bubblewrap: openat2(fd, "/", RESOLVE_IN_ROOT) for bind mounts.
+ */
+int rebase_openat2_path(Tracee *tracee, unsigned long long resolve)
+{
+	const unsigned long long in_root = 0x10;  /* RESOLVE_IN_ROOT */
+	const unsigned long long beneath = 0x08;  /* RESOLVE_BENEATH */
+	char path[PATH_MAX];
+	const char *rel;
+	int status;
+
+	if ((resolve & (in_root | beneath)) == 0)
+		return 0;
+
+	status = get_sysarg_path(tracee, path, SYSARG_2);
+	if (status < 0)
+		return status;
+	if (path[0] != '/')
+		return 0;
+
+	rel = path;
+	while (*rel == '/')
+		rel++;
+	return set_sysarg_path(tracee, rel[0] != '\0' ? rel : ".", SYSARG_2);
 }

@@ -38,6 +38,7 @@
 #include <stddef.h>        /* offsetof(3), */
 #include <stdint.h>        /* uint*_t, UINT*_MAX, */
 #include <assert.h>        /* assert(3), */
+#include <sys/mman.h>      /* PROT_EXEC, MAP_ANONYMOUS, */
 
 #include "syscall/seccomp.h"
 #include "tracee/tracee.h"
@@ -90,20 +91,28 @@ static int add_statements(struct sock_fprog *program, size_t nb_statements,
 }
 
 /**
+ * Number of statements add_trace_syscall() appends for @flag.
+ */
+static size_t length_trace_syscall(int flag)
+{
+	return (flag & FILTER_PROT_EXEC) != 0 ? 7 : 2;
+}
+
+/**
  * Append to @program->filter the statements required to notify PRoot
  * about the given @syscall made by a tracee, with the given @flag.
  * This function returns -errno if an error occurred, otherwise 0.
  */
 static int add_trace_syscall(struct sock_fprog *program, word_t syscall, int flag)
 {
+	const size_t args_offset = offsetof(struct seccomp_data, args);
 	int status;
 
 	/* Sanity check.  */
 	if (syscall > UINT32_MAX)
 		return -ERANGE;
 
-	#define LENGTH_TRACE_SYSCALL 2
-	struct sock_filter statements[LENGTH_TRACE_SYSCALL] = {
+	struct sock_filter statements[2] = {
 		/* Compare the accumulator with the expected syscall:
 		 * skip the next statement if not equal.  */
 		BPF_JUMP(BPF_JMP + BPF_JEQ + BPF_K, syscall, 0, 1),
@@ -112,9 +121,27 @@ static int add_trace_syscall(struct sock_fprog *program, word_t syscall, int fla
 		BPF_STMT(BPF_RET + BPF_K, SECCOMP_RET_TRACE + flag)
 	};
 
+	/* mmap(addr, length, prot, flags, fd, offset): only file mappings
+	 * with PROT_EXEC are of interest (exec on noexec mounts, see
+	 * extension/dn_storage), the low 32 bits of the arguments are
+	 * enough.  The accumulator keeps the syscall number when it does
+	 * not match.  */
+	struct sock_filter prot_exec[7] = {
+		BPF_JUMP(BPF_JMP + BPF_JEQ + BPF_K, syscall, 0, 6),
+		BPF_STMT(BPF_LD + BPF_W + BPF_ABS, args_offset + 2 * sizeof(uint64_t)),
+		BPF_JUMP(BPF_JMP + BPF_JSET + BPF_K, PROT_EXEC, 0, 3),
+		BPF_STMT(BPF_LD + BPF_W + BPF_ABS, args_offset + 3 * sizeof(uint64_t)),
+		BPF_JUMP(BPF_JMP + BPF_JSET + BPF_K, MAP_ANONYMOUS, 1, 0),
+		BPF_STMT(BPF_RET + BPF_K, SECCOMP_RET_TRACE + flag),
+		BPF_STMT(BPF_RET + BPF_K, SECCOMP_RET_ALLOW),
+	};
+
 	DEBUG_FILTER("FILTER:     trace if syscall == %ld\n", syscall);
 
-	status = add_statements(program, LENGTH_TRACE_SYSCALL, statements);
+	if ((flag & FILTER_PROT_EXEC) != 0)
+		status = add_statements(program, 7, prot_exec);
+	else
+		status = add_statements(program, 2, statements);
 	if (status < 0)
 		return status;
 
@@ -123,11 +150,11 @@ static int add_trace_syscall(struct sock_fprog *program, word_t syscall, int fla
 
 /**
  * Append to @program->filter the statements that allow anything (if
- * unfiltered).  Note that @nb_traced_syscalls is used to make a
+ * unfiltered).  Note that @nb_trace_statements is used to make a
  * sanity check.  This function returns -errno if an error occurred,
  * otherwise 0.
  */
-static int end_arch_section(struct sock_fprog *program, size_t nb_traced_syscalls)
+static int end_arch_section(struct sock_fprog *program, size_t nb_trace_statements)
 {
 	int status;
 
@@ -144,7 +171,7 @@ static int end_arch_section(struct sock_fprog *program, size_t nb_traced_syscall
 
 	/* Sanity check, see start_arch_section().  */
 	if (   talloc_array_length(program->filter) - program->len
-	    != LENGTH_END_SECTION + nb_traced_syscalls * LENGTH_TRACE_SYSCALL)
+	    != LENGTH_END_SECTION + nb_trace_statements)
 		return -ERANGE;
 
 	return 0;
@@ -152,16 +179,15 @@ static int end_arch_section(struct sock_fprog *program, size_t nb_traced_syscall
 
 /**
  * Append to @program->filter the statements that check the current
- * @architecture.  Note that @nb_traced_syscalls is used to make a
+ * @architecture.  Note that @nb_trace_statements is used to make a
  * sanity check.  This function returns -errno if an error occurred,
  * otherwise 0.
  */
-static int start_arch_section(struct sock_fprog *program, uint32_t arch, size_t nb_traced_syscalls)
+static int start_arch_section(struct sock_fprog *program, uint32_t arch, size_t nb_trace_statements)
 {
 	const size_t arch_offset    = offsetof(struct seccomp_data, arch);
 	const size_t syscall_offset = offsetof(struct seccomp_data, nr);
-	const size_t section_length = LENGTH_END_SECTION +
-					nb_traced_syscalls * LENGTH_TRACE_SYSCALL;
+	const size_t section_length = LENGTH_END_SECTION + nb_trace_statements;
 	int status;
 
 	/* Sanity checks.  */
@@ -191,7 +217,7 @@ static int start_arch_section(struct sock_fprog *program, uint32_t arch, size_t 
 	};
 
 	DEBUG_FILTER("FILTER: if arch == %ld, up to %zdth statement\n",
-		arch, nb_traced_syscalls);
+		arch, nb_trace_statements);
 
 	status = add_statements(program, LENGTH_START_SECTION, statements);
 	if (status < 0)
@@ -256,7 +282,7 @@ static int set_seccomp_filters(const FilteredSysnum *sysnums)
 	size_t nb_archs = sizeof(seccomp_archs) / sizeof(SeccompArch);
 
 	struct sock_fprog program = { .len = 0, .filter = NULL };
-	size_t nb_traced_syscalls;
+	size_t nb_trace_statements;
 	size_t i, j, k;
 	int status;
 
@@ -268,19 +294,19 @@ static int set_seccomp_filters(const FilteredSysnum *sysnums)
 	for (i = 0; i < nb_archs; i++) {
 		word_t syscall;
 
-		nb_traced_syscalls = 0;
+		nb_trace_statements = 0;
 
 		/* Pre-compute the number of traced syscalls for this architecture.  */
 		for (j = 0; j < seccomp_archs[i].nb_abis; j++) {
 			for (k = 0; sysnums[k].value != PR_void; k++) {
 				syscall = detranslate_sysnum(seccomp_archs[i].abis[j], sysnums[k].value);
 				if (syscall != SYSCALL_AVOIDER)
-					nb_traced_syscalls++;
+					nb_trace_statements += length_trace_syscall(sysnums[k].flags);
 			}
 		}
 
 		/* Filter: if handled architecture */
-		status = start_arch_section(&program, seccomp_archs[i].value, nb_traced_syscalls);
+		status = start_arch_section(&program, seccomp_archs[i].value, nb_trace_statements);
 		if (status < 0)
 			goto end;
 
@@ -299,7 +325,7 @@ static int set_seccomp_filters(const FilteredSysnum *sysnums)
 		}
 
 		/* Filter: allow untraced syscalls for this architecture */
-		status = end_arch_section(&program, nb_traced_syscalls);
+		status = end_arch_section(&program, nb_trace_statements);
 		if (status < 0)
 			goto end;
 	}
@@ -420,6 +446,14 @@ static FilteredSysnum proot_sysnums[] = {
 	{ PR_truncate64,	0 },
 	{ PR_umount,		FILTER_SYSEXIT },
 	{ PR_umount2,		FILTER_SYSEXIT },
+	{ PR_open_tree,	FILTER_SYSEXIT },
+	{ PR_move_mount,	FILTER_SYSEXIT },
+	{ PR_fsopen,	FILTER_SYSEXIT },
+	{ PR_fsconfig,	FILTER_SYSEXIT },
+	{ PR_fsmount,	FILTER_SYSEXIT },
+	{ PR_fspick,	FILTER_SYSEXIT },
+	{ PR_mount_setattr,	FILTER_SYSEXIT },
+	{ PR_fchmodat2,		FILTER_SYSEXIT },
 	{ PR_uname,		FILTER_SYSEXIT },
 	{ PR_unshare,		FILTER_SYSEXIT },
 	{ PR_setns,		FILTER_SYSEXIT },
@@ -472,10 +506,14 @@ static int merge_filtered_sysnums(TALLOC_CTX *context, FilteredSysnum **sysnums,
 			/* The last item is the terminator.  */
 			(*sysnums)[j + 1].value = PR_void;
 		}
-		else
+		else {
 			/* The sysnum is already filtered, merge the
-			 * flags.  */
-			(*sysnums)[j].flags |= new_sysnums[i].flags;
+			 * flags.  A full trace wins over FILTER_PROT_EXEC.  */
+			int merged = (*sysnums)[j].flags | new_sysnums[i].flags;
+			if ((((*sysnums)[j].flags ^ new_sysnums[i].flags) & FILTER_PROT_EXEC) != 0)
+				merged &= ~FILTER_PROT_EXEC;
+			(*sysnums)[j].flags = merged;
+		}
 	}
 
 	return 0;

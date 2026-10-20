@@ -43,6 +43,9 @@ typedef struct {
 
 #define FILTER_SYSEXIT  0x1
 
+/* mmap(2)/mmap2(2): only trace mappings of files with PROT_EXEC.  */
+#define FILTER_PROT_EXEC 0x2
+
 extern int enable_syscall_filtering(const Tracee *tracee);
 extern int filtered_sysnum_flags(const Tracee *tracee, Sysnum sysnum);
 

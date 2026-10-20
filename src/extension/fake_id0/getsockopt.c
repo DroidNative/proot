@@ -1,3 +1,4 @@
+#include <unistd.h>      /* getuid(2), */
 #include <sys/socket.h>  /* SOL_SOCKET,SO_PEERCRED */
 
 #include "tracee/reg.h"
@@ -33,7 +34,19 @@ int handle_getsockopt_exit_end(Tracee *tracee) {
 		int status = read_data(tracee, &cred, cred_addr, sizeof(struct ucred));
 		if (status) return 0;
 		Config *peer_config = get_fake_id_for_pid(cred.pid);
-		if (peer_config == NULL) return 0;
+		if (peer_config == NULL) {
+			/* Not one of our tracees.  A peer running as our own
+			 * real user is most likely under another PRoot of the
+			 * same setup (e.g. a D-Bus client talking to a session
+			 * bus started separately): give it the identity this
+			 * tracee has, otherwise EXTERNAL authentication between
+			 * two fake roots fails.  */
+			if (cred.uid != getuid())
+				return 0;
+			peer_config = get_fake_id_for_pid(tracee->pid);
+			if (peer_config == NULL)
+				return 0;
+		}
 		cred.uid = peer_config->euid;
 		cred.gid = peer_config->egid;
 		write_data(tracee, cred_addr, &cred, sizeof(struct ucred));

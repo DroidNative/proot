@@ -74,6 +74,7 @@ typedef unsigned char byte_t;
 
     #define HOST_ELF_MACHINE {62, 3, 6, 0}
     #define RED_ZONE_SIZE 128
+    #define OFFSETOF_STAT_MODE_32 16
     #define OFFSETOF_STAT_UID_32 24
     #define OFFSETOF_STAT_GID_32 28
 
@@ -97,6 +98,7 @@ typedef unsigned char byte_t;
     #define user_regs_struct user_regs
     #define HOST_ELF_MACHINE {40, 0};
     #define RED_ZONE_SIZE 0
+    #define OFFSETOF_STAT_MODE_32 0
     #define OFFSETOF_STAT_UID_32 0
     #define OFFSETOF_STAT_GID_32 0
     #define EM_ARM 40
@@ -132,6 +134,7 @@ typedef unsigned char byte_t;
 
     #define HOST_ELF_MACHINE {183, 0};
     #define RED_ZONE_SIZE 0
+    #define OFFSETOF_STAT_MODE_32 16
     #define OFFSETOF_STAT_UID_32 24
     #define OFFSETOF_STAT_GID_32 28
 
@@ -162,6 +165,7 @@ typedef unsigned char byte_t;
 
     #define HOST_ELF_MACHINE {3, 6, 0};
     #define RED_ZONE_SIZE 0
+    #define OFFSETOF_STAT_MODE_32 0
     #define OFFSETOF_STAT_UID_32 0
     #define OFFSETOF_STAT_GID_32 0
 
@@ -183,6 +187,7 @@ typedef unsigned char byte_t;
     #define user_regs_struct pt_regs
     #define HOST_ELF_MACHINE {42, 0};
     #define RED_ZONE_SIZE 0
+    #define OFFSETOF_STAT_MODE_32 0
     #define OFFSETOF_STAT_UID_32 0
     #define OFFSETOF_STAT_GID_32 0
     #define NO_MISALIGNED_ACCESS 1

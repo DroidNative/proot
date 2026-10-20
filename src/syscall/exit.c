@@ -444,7 +444,23 @@ void translate_syscall_exit(Tracee *tracee)
 				break;
 		}
 
-		status = detranslate_path(tracee, referee, referer);
+		/* A descriptor whose guest path was recorded when it was
+		 * opened is reported with exactly that path: its host path
+		 * can be visible at several guest paths (recursive binds,
+		 * pivot_root), and bubblewrap looks the answer up in the
+		 * mount table.  */
+		{
+			const char *recorded = NULL;
+
+			if (proc_fd.fd >= 0 && proc_fd.pid == tracee->pid)
+				recorded = opath_fd_guest_path(tracee, proc_fd.fd);
+			if (recorded != NULL) {
+				strcpy(referee, recorded);
+				status = strlen(referee) + 1;
+			}
+			else
+				status = detranslate_path(tracee, referee, referer);
+		}
 		if (status < 0)
 			break;
 
@@ -528,6 +544,9 @@ void translate_syscall_exit(Tracee *tracee)
 		 * rustix falls back to reading /proc/self/auxv directly. */
 		char path_buf[sizeof("/proc/self/auxv")];
 		Reg path_reg = (syscall_number == PR_open) ? SYSARG_1 : SYSARG_2;
+
+		/* O_PATH descriptor tracking for mount(2) emulation. */
+		record_opath_fd(tracee, (int) syscall_result);
 
 		if ((int) syscall_result < 0)
 			goto end;

@@ -28,6 +28,7 @@
 #include "cli/cli.h"
 #include "cli/note.h"
 #include "extension/extension.h"
+#include "extension/dn_storage/dn_storage.h"
 #include "extension/sysvipc/sysvipc.h"
 #include "path/binding.h"
 #include "attribute.h"
@@ -319,6 +320,47 @@ static int handle_option_sysvipc(Tracee *tracee, const Cli *cli UNUSED, const ch
 	return 0;
 }
 
+static int handle_option_fat_bind(Tracee *tracee, const Cli *cli, const char *value)
+{
+	char host[PATH_MAX];
+	const char *colon;
+	size_t length;
+
+	colon = strchr(value, ':');
+	length = colon != NULL ? (size_t) (colon - value) : strlen(value);
+	if (length == 0 || length >= PATH_MAX)
+		return -1;
+	memcpy(host, value, length);
+	host[length] = '\0';
+
+	if (dn_storage_add_fat(host) < 0)
+		return -1;
+	return handle_option_b(tracee, cli, value);
+}
+
+static int handle_option_fuse(Tracee *tracee, const Cli *cli, const char *value UNUSED)
+{
+	char binding[PATH_MAX];
+
+	if (dn_storage_enable_fuse() < 0)
+		return -1;
+	if ((size_t) snprintf(binding, sizeof(binding), "%s:/dev/fuse", dn_fuse_device()) >= sizeof(binding))
+		return -1;
+	return handle_option_b(tracee, cli, binding);
+}
+
+static int handle_option_image(Tracee *tracee, const Cli *cli, const char *value)
+{
+	char binding[PATH_MAX];
+
+	// A broken image must not keep the guest from starting
+	if (dn_storage_add_image(value, binding) < 0) {
+		note(tracee, WARNING, USER, "disk image %s not mounted", value);
+		return 0;
+	}
+	return handle_option_b(tracee, cli, binding);
+}
+
 static int handle_option_L(Tracee *tracee, const Cli *cli UNUSED, const char *value UNUSED)
 {
         (void) initialize_extension(tracee, fix_symlink_size_callback, NULL);
@@ -379,6 +421,17 @@ static int pre_initialize_bindings(Tracee *tracee, const Cli *cli,
 			size_t argc UNUSED, char *const argv[] UNUSED, size_t cursor)
 {
 	int status;
+
+	/* DroidNative: V4L2 devices emulated for the cameras the host
+	 * application offers in this directory (extension/dn_v4l2).  */
+	if (getenv("PROOT_DN_VIDEO_DIR") != NULL)
+		(void) initialize_extension(tracee, dn_v4l2_callback, getenv("PROOT_DN_VIDEO_DIR"));
+
+	/* DroidNative storage, last so that it comes first in the list
+	 * of extensions (extension/dn_storage).  */
+	status = dn_storage_initialize(tracee);
+	if (status < 0)
+		return -1;
 
 	/* Default to "." if no CWD were specified.  */
 	if (tracee->fs->cwd == NULL) {

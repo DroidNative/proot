@@ -61,6 +61,7 @@ OBJECTS += \
 	ptrace/wait.o		\
 	extension/extension.o	\
 	extension/ashmem_memfd/ashmem_memfd.o \
+	extension/dn_v4l2/dn_v4l2.o \
 	extension/kompat/kompat.o \
 	extension/fake_id0/chown.o \
 	extension/fake_id0/chroot.o \
@@ -88,7 +89,20 @@ OBJECTS += \
 	extension/sysvipc/sysvipc_sem.o \
 	extension/sysvipc/sysvipc_shm.o \
 	extension/link2symlink/link2symlink.o \
-	extension/fix_symlink_size/fix_symlink_size.o
+	extension/fix_symlink_size/fix_symlink_size.o \
+	extension/dn_storage/dn_storage.o \
+	extension/dn_storage/exec.o \
+	extension/dn_storage/fuse.o \
+	extension/dn_storage/image.o
+
+# Disk images need SQLite: the amalgamation from SQLITE_DIR when given
+# (Android builds), the system library otherwise.
+ifdef SQLITE_DIR
+  OBJECTS += sqlite3.o
+  CPPFLAGS += -I$(SQLITE_DIR)
+else
+  LDFLAGS += -lsqlite3
+endif
 
 define define_from_arch.h
 $2$1 := $(shell $(CC) $1 -E -dM -DNO_LIBC_HEADER $(SRC)/arch.h | grep -w $2 | cut -f 3 -d ' ')
@@ -200,6 +214,11 @@ $(USE_BUILD_H): build.h
 %.o: %.c
 	@mkdir -p $(dir $@)
 	$(COMPILE)
+
+sqlite3.o: $(SQLITE_DIR)/sqlite3.c
+	$(Q)$($(quiet)CC) $(CPPFLAGS) -Os -w -DSQLITE_THREADSAFE=0 -DSQLITE_OMIT_LOAD_EXTENSION \
+		-DSQLITE_DEFAULT_MEMSTATUS=0 -DSQLITE_DQS=0 -DSQLITE_OMIT_DEPRECATED -DSQLITE_OMIT_SHARED_CACHE \
+		-c $< -o $@
 
 cli/%-licenses.o: licenses cli/cli.o
 	$(OBJIFY)

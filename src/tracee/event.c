@@ -47,6 +47,7 @@
 #include "syscall/pipe_shadow.h"
 #include "ptrace/wait.h"
 #include "extension/extension.h"
+#include "extension/dn_storage/dn_storage.h"
 #include "execve/elf.h"
 
 #include "attribute.h"
@@ -406,7 +407,7 @@ int event_loop()
 		shadow_pipes_set_timer(shadow_pipes_held());
 
 		/* Wait for the next tracee's stop. */
-		pid = waitpid(-1, &tracee_status, __WALL);
+		pid = dn_storage_waitpid(&tracee_status);
 		saved_errno = errno;
 		shadow_pipes_set_timer(false);
 		errno = saved_errno;
@@ -438,10 +439,34 @@ int event_loop()
 		}
 
 		signal = handle_tracee_event(tracee, tracee_status);
+
+		/* Kept stopped until an emulated FUSE file-system has
+		 * answered, see resume_parked_tracee().  */
+		if (tracee->dn.parked) {
+			tracee->dn.park_status = tracee_status;
+			continue;
+		}
+
 		(void) restart_tracee(tracee, signal);
 	}
 
 	return last_exit_status;
+}
+
+/**
+ * Handle again the stop of @tracee that waited for an emulated FUSE
+ * file-system (extension/dn_storage).  Its sysenter stage was left
+ * untouched, so this is the same as handling it for the first time.
+ */
+void resume_parked_tracee(Tracee *tracee)
+{
+	int signal;
+
+	tracee->dn.parked = false;
+	tracee->restart_how = 0;
+	signal = handle_tracee_event(tracee, tracee->dn.park_status);
+	if (!tracee->dn.parked)
+		(void) restart_tracee(tracee, signal);
 }
 
 /**
@@ -486,14 +511,21 @@ int handle_tracee_event(Tracee *tracee, int tracee_status)
 	signal = 0;
 
 	if (WIFEXITED(tracee_status)) {
-		last_exit_status = WEXITSTATUS(tracee_status);
+		/* proot exits like a shell: with the status of the first
+		 * tracee, not of whichever process happened to end last.  */
+		if (tracee->vpid == 1 || last_exit_status == -1)
+			last_exit_status = WEXITSTATUS(tracee_status);
 		VERBOSE(tracee, 1,
 			"vpid %" PRIu64 ": exited with status %d",
-			tracee->vpid, last_exit_status);
+			tracee->vpid, WEXITSTATUS(tracee_status));
 		terminate_tracee(tracee);
 	}
 	else if (WIFSIGNALED(tracee_status)) {
 		check_architecture(tracee);
+		/* Killed (out of memory, crash): 128 + signal, as a shell
+		 * reports it, instead of a status of another process.  */
+		if (tracee->vpid == 1)
+			last_exit_status = 128 + WTERMSIG(tracee_status);
 		VERBOSE(tracee, (int) (tracee->vpid != 1),
 			"vpid %" PRIu64 ": terminated with signal %d",
 			tracee->vpid, WTERMSIG(tracee_status));

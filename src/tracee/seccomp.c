@@ -180,10 +180,19 @@ static int handle_seccomp_event_common(Tracee *tracee)
 		if (how_size > sizeof(how))
 			how_size = sizeof(how);
 		ret = read_data(tracee, &how, peek_reg(tracee, CURRENT, SYSARG_3), how_size);
+		if (ret >= 0)
+			ret = rebase_openat2_path(tracee, how.resolve);
 		if (ret < 0) {
 			set_result_after_seccomp(tracee, ret);
 			break;
 		}
+		/* RESOLVE_IN_ROOT directory opens are bubblewrap walking to a
+		 * mount point; it only uses the result as a base for *at()
+		 * calls.  O_PATH keeps that working where the directory may
+		 * be traversed but not read, like /dev for Android apps.  */
+		if (   (how.resolve & 0x10) != 0 && (how.flags & O_DIRECTORY) != 0
+		    && (how.flags & (O_ACCMODE | O_PATH | O_CREAT)) == O_RDONLY)
+			how.flags |= O_PATH;
 		set_sysnum(tracee, PR_openat);
 		poke_reg(tracee, SYSARG_3, how.flags);
 		poke_reg(tracee, SYSARG_4, how.mode);
@@ -208,8 +217,7 @@ static int handle_seccomp_event_common(Tracee *tracee)
 	 * they succeeded and apply the mount/pivot_root binding
 	 * emulation so sandbox helpers like bubblewrap can proceed.  */
 	case PR_mount:
-		apply_emulated_mount(tracee);
-		set_result_after_seccomp(tracee, 0);
+		set_result_after_seccomp(tracee, apply_emulated_mount(tracee));
 		break;
 
 	case PR_pivot_root:
@@ -224,8 +232,23 @@ static int handle_seccomp_event_common(Tracee *tracee)
 		break;
 
 	case PR_unshare:
+		set_result_after_seccomp(tracee,
+			emulate_unshare(tracee, peek_reg(tracee, CURRENT, SYSARG_1)));
+		break;
+
 	case PR_setns:
 		set_result_after_seccomp(tracee, 0);
+		break;
+
+	case PR_open_tree:
+	case PR_move_mount:
+	case PR_fsopen:
+	case PR_fsconfig:
+	case PR_fsmount:
+	case PR_fspick:
+	case PR_mount_setattr:
+	case PR_fchmodat2:
+		set_result_after_seccomp(tracee, -ENOSYS);
 		break;
 
 	case PR_getpgrp:

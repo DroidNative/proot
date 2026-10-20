@@ -23,6 +23,7 @@
 
 #ifdef __ANDROID__
 #include <linux/ashmem.h> /* ASHMEM_* */
+#include <sys/syscall.h> /* SYS_memfd_create */
 #else
 #include <unistd.h> /* ftruncate */
 #endif
@@ -772,6 +773,20 @@ int sysvipc_shm_namespace_destructor(struct SysVIpcNamespace *ipc_namespace) {
 }
 
 static int sysvipc_shm_do_allocate(size_t size, int shmid) {
+#if defined(__ANDROID__) && defined(SYS_memfd_create)
+	/* Android 10+ denies apps that target it /dev/ashmem: memfd first
+	 * (kernel 3.17+, allowed by the app seccomp filter).  */
+	{
+		char name[32];
+		snprintf(name, sizeof(name), "sysvshm_0x%X", shmid);
+		int mfd = syscall(SYS_memfd_create, name, 0);
+		if (mfd >= 0) {
+			if (ftruncate(mfd, size) == 0)
+				return mfd;
+			close(mfd);
+		}
+	}
+#endif
 #ifdef __ANDROID__
 	int fd = open("/dev/ashmem", O_RDWR, 0);
 	if (fd < 0) return -ENOSPC;

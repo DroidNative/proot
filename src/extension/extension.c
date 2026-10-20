@@ -129,6 +129,7 @@ void inherit_extensions(Tracee *child, Tracee *parent, word_t clone_flags)
 {
 	Extension *parent_extension;
 	Extension *child_extension;
+	Extension *previous = NULL;
 	int status;
 
 	if (parent->extensions == NULL)
@@ -154,6 +155,15 @@ void inherit_extensions(Tracee *child, Tracee *parent, word_t clone_flags)
 				"can't create a new extension for pid %d", child->pid);
 			continue;
 		}
+
+		/* ... in the same order as for the parent, since
+		 * extensions are notified one after the other; new
+		 * ones are inserted at the head.  */
+		if (previous != NULL) {
+			LIST_REMOVE(child_extension, link);
+			LIST_INSERT_AFTER(previous, child_extension, link);
+		}
+		previous = child_extension;
 
 		if (status == 0) {
 			/* ... with a shared config or ...  */

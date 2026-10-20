@@ -41,6 +41,7 @@
 #include "path/temp.h"
 #include "path/binding.h"
 #include "extension/extension.h"
+#include "extension/dn_storage/dn_storage.h"
 #include "tracee/tracee.h"
 #include "syscall/syscall.h"
 #include "syscall/sysnum.h"
@@ -145,8 +146,10 @@ int translate_and_check_exec(Tracee *tracee, char host_path[PATH_MAX], const cha
 	if (status < 0)
 		return -ENOENT;
 
+	/* On a noexec mount the loader's mappings are copied instead
+	 * (extension/dn_storage).  */
 	status = access(host_path, X_OK);
-	if (status < 0)
+	if (status < 0 && !(errno == EACCES && dn_exec_allowed(host_path)))
 		return -EACCES;
 
 	status = lstat(host_path, &statl);

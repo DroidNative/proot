@@ -51,6 +51,10 @@ struct readlink_proc_fd_state {
 
 extern int get_sysarg_path(const Tracee *tracee, char path[PATH_MAX], Reg reg);
 extern int set_sysarg_path(Tracee *tracee, const char path[PATH_MAX], Reg reg);
+extern int rebase_openat2_path(Tracee *tracee, unsigned long long resolve);
+extern void record_opath_fd(Tracee *tracee, int fd);
+extern const char *opath_fd_guest_path(Tracee *tracee, int fd);
+extern int emulate_unshare(Tracee *tracee, word_t flags);
 extern int set_sysarg_data(Tracee *tracee, const void *tracer_ptr, word_t size, Reg reg);
 
 extern void translate_syscall(Tracee *tracee);
@@ -60,7 +64,7 @@ extern bool is_voided_syscall(const Tracee *tracee, RegVersion version);
 
 extern void handle_netlink_reply_exit(Tracee *tracee, word_t syscall_number);
 
-extern void apply_emulated_mount(Tracee *tracee);
+extern int apply_emulated_mount(Tracee *tracee);
 extern void apply_emulated_pivot_root(Tracee *tracee);
 extern void apply_emulated_umount(Tracee *tracee);
 

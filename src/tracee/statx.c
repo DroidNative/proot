@@ -4,6 +4,10 @@
 #include "tracee/statx.h"
 #include "tracee/mem.h"
 
+#ifndef STATX_MNT_ID
+#define STATX_MNT_ID 0x00001000U
+#endif
+
 int handle_statx_syscall(Tracee *tracee, bool from_sigsys) {
 	RegVersion regVersion = from_sigsys ? CURRENT : ORIGINAL;
 	struct statx_syscall_state state = {};
@@ -115,12 +119,27 @@ int handle_statx_syscall(Tracee *tracee, bool from_sigsys) {
 		}
 		state.statx_buf.stx_rdev_major = major(stat_buf.st_rdev);
 		state.statx_buf.stx_rdev_minor = minor(stat_buf.st_rdev);
+		state.statx_buf.stx_dev_major = major(stat_buf.st_dev);
+		state.statx_buf.stx_dev_minor = minor(stat_buf.st_dev);
 		state.updated_stats = true;
 	} else {
 		status = read_data(tracee, &state.statx_buf, peek_reg(tracee, ORIGINAL, SYSARG_5), sizeof(struct statx));
 		if (status < 0) {
 			return status;
 		}
+	}
+
+	/* Kernels before 5.8 (most Android devices) have no STATX_MNT_ID, but
+	 * libglnx (Flatpak, OSTree) treats it as required and fails with
+	 * ENODATA.  Provide a stand-in derived from the device number: equal
+	 * for files of one file system, which is what callers compare.  */
+	if ((mask & STATX_MNT_ID) != 0
+	    && (state.statx_buf.stx_mask & STATX_MNT_ID) == 0) {
+		state.statx_buf.stx_mnt_id =
+			((uint64_t) state.statx_buf.stx_dev_major << 20)
+			| (state.statx_buf.stx_dev_minor & 0xfffff);
+		state.statx_buf.stx_mask |= STATX_MNT_ID;
+		state.updated_stats = true;
 	}
 
 	/* Notify extensions */

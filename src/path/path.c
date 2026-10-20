@@ -34,6 +34,7 @@
 #include <inttypes.h>  /* PRI*, */
 
 #include "path/path.h"
+#include "syscall/syscall.h"  /* opath_fd_guest_path(), */
 #include "path/binding.h"
 #include "path/canon.h"
 #include "path/proc.h"
@@ -339,11 +340,24 @@ int translate_path(Tracee *tracee, char result[PATH_MAX], int dir_fd,
 		if (result[0] != '/')
 			return -ENOTDIR;
 
-		/* Remove the leading "root" part of the base
-		 * (required!). */
-		status = detranslate_path(tracee, result, NULL);
-		if (status < 0)
-			return status;
+		/* Prefer the guest path the descriptor was opened with,
+		 * when it was recorded: the host path may be visible at
+		 * several guest paths (recursive binds, pivot_root), and
+		 * something else may have been mounted there since.  */
+		{
+			const char *recorded = tracee != NULL
+				? opath_fd_guest_path(tracee, dir_fd) : NULL;
+
+			if (recorded != NULL)
+				strcpy(result, recorded);
+			else {
+				/* Remove the leading "root" part of the base
+				 * (required!). */
+				status = detranslate_path(tracee, result, NULL);
+				if (status < 0)
+					return status;
+			}
+		}
 	}
 	/* It is relative to the current working directory.  */
 	else {
@@ -469,6 +483,23 @@ int detranslate_path(Tracee *tracee, char path[PATH_MAX], const char t_referrer[
 	else {
 		sanity_check = true;
 		follow_binding = true;
+	}
+
+	/* Emulated hard links (--link2symlink) are symlinks into
+	 * PROOT_L2S_DIR, written by PRoot itself as host paths.  They must
+	 * resolve from any binding, e.g. from a runtime bound to /usr inside
+	 * a bubblewrap sandbox, where the l2s directory is another binding
+	 * (see emulate_pivot_root()).  */
+	if (!follow_binding && t_referrer != NULL) {
+		const char *l2s_dir = getenv("PROOT_L2S_DIR");
+		size_t length = l2s_dir != NULL ? strlen(l2s_dir) : 0;
+
+		while (length > 1 && l2s_dir[length - 1] == '/')
+			length--;
+		if (   length > 1
+		    && strncmp(path, l2s_dir, length) == 0
+		    && path[length] == '/')
+			follow_binding = true;
 	}
 
 	if (follow_binding) {

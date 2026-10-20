@@ -136,6 +136,17 @@ static inline off_t offsetof_stat_uid(const Tracee *tracee)
 }
 
 /**
+ * Return the offset of the 'mode' field in a 'stat' structure
+ * according to the ABI currently used by the given @tracee.
+ */
+static inline off_t offsetof_stat_mode(const Tracee *tracee)
+{
+	return (is_32on64_mode(tracee)
+		? OFFSETOF_STAT_MODE_32
+		: offsetof(struct stat, st_mode));
+}
+
+/**
  * Return the offset of the 'gid' field in a 'stat' structure
  * according to the ABI currently used by the given @tracee.
  */
