@@ -46,6 +46,12 @@ typedef struct {
 /* mmap(2)/mmap2(2): only trace mappings of files with PROT_EXEC.  */
 #define FILTER_PROT_EXEC 0x2
 
+/* mprotect(2): only trace requests for PROT_EXEC.  */
+#define FILTER_MPROTECT_EXEC 0x4
+
+/* Flags that trace a syscall only for some of its arguments.  */
+#define FILTER_ARGS (FILTER_PROT_EXEC | FILTER_MPROTECT_EXEC)
+
 extern int enable_syscall_filtering(const Tracee *tracee);
 extern int filtered_sysnum_flags(const Tracee *tracee, Sysnum sysnum);
 

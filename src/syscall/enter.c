@@ -2141,6 +2141,76 @@ static void maybe_redirect_userns_file(Tracee *tracee, Reg reg)
 }
 
 /**
+ * DroidNative: every tracee is ptraced by PRoot, so the kernel reports
+ * PRoot as its tracer in /proc/<pid>/status. Programs that look for a
+ * debugger there (Steam's Plat_IsInDebugSession, anti-debug checks) then
+ * stop in int3 or refuse to run. An open of such a file gets a copy with
+ * "TracerPid: 0" instead; the copy lives in tracee->ctx, so it is removed
+ * at the tracee's next event, after the open.  @reg holds the translated
+ * path.
+ */
+static void maybe_hide_tracer(Tracee *tracee, Reg reg)
+{
+	char host_path[PATH_MAX];
+	char real_path[PATH_MAX];
+	char line[512];
+	const char *rest;
+	const char *copy;
+	FILE *in, *out;
+	bool found = false;
+
+	if (get_sysarg_path(tracee, host_path, reg) < 0)
+		return;
+	if (strncmp(host_path, "/proc/", 6) != 0)
+		return;
+	rest = host_path + 6;
+
+	// /proc/self and /proc/thread-self would be PRoot's own files here
+	if (strncmp(rest, "self/", 5) == 0)
+		snprintf(real_path, sizeof(real_path), "/proc/%d/%s", tracee->pid, rest + 5);
+	else if (strncmp(rest, "thread-self/", 12) == 0)
+		snprintf(real_path, sizeof(real_path), "/proc/%d/task/%d/%s",
+			 tracee->pid, tracee->pid, rest + 12);
+	else
+		snprintf(real_path, sizeof(real_path), "%s", host_path);
+
+	// /proc/<pid>/status or /proc/<pid>/task/<tid>/status only
+	rest = real_path + 6;
+	rest += strspn(rest, "0123456789");
+	if (rest == real_path + 6)
+		return;
+	if (strncmp(rest, "/task/", 6) == 0) {
+		const char *tid = rest + 6;
+		rest = tid + strspn(tid, "0123456789");
+		if (rest == tid)
+			return;
+	}
+	if (strcmp(rest, "/status") != 0)
+		return;
+
+	in = fopen(real_path, "r");
+	if (in == NULL)
+		return;
+	copy = create_temp_file(tracee->ctx, "proot-status");
+	out = (copy != NULL ? fopen(copy, "w") : NULL);
+	if (out == NULL) {
+		fclose(in);
+		return;
+	}
+	while (fgets(line, sizeof(line), in) != NULL) {
+		if (strncmp(line, "TracerPid:", 10) == 0) {
+			fputs("TracerPid:\t0\n", out);
+			found = true;
+		}
+		else
+			fputs(line, out);
+	}
+	fclose(in);
+	if (fclose(out) == 0 && found)
+		(void) set_sysarg_path(tracee, copy, reg);
+}
+
+/**
  * Result of an emulated unshare(@flags): 0, or -ENOSPC once the tracee
  * used up the user namespaces it limited itself to (see userns_left).
  */
@@ -2919,8 +2989,10 @@ int translate_syscall_enter(Tracee *tracee)
 			status = translate_sysarg(tracee, SYSARG_1, SYMLINK);
 		else
 			status = translate_sysarg(tracee, SYSARG_1, REGULAR);
-		if (status >= 0)
+		if (status >= 0) {
 			maybe_redirect_userns_file(tracee, SYSARG_1);
+			maybe_hide_tracer(tracee, SYSARG_1);
+		}
 		break;
 
 	case PR_fchownat:
@@ -3085,8 +3157,10 @@ int translate_syscall_enter(Tracee *tracee)
 			status = translate_path2(tracee, dirfd, path, SYSARG_2, SYMLINK);
 		else
 			status = translate_path2(tracee, dirfd, path, SYSARG_2, REGULAR);
-		if (status >= 0)
+		if (status >= 0) {
 			maybe_redirect_userns_file(tracee, SYSARG_2);
+			maybe_hide_tracer(tracee, SYSARG_2);
+		}
 		break;
 
 	case PR_readlinkat:

@@ -36,6 +36,7 @@
 #include <inttypes.h>   /* PRI*, */
 
 #include "tracee/tracee.h"
+#include "tracee/seccomp.h"
 #include "tracee/reg.h"
 #include "tracee/mem.h"
 #include "path/binding.h"
@@ -662,6 +663,7 @@ static int attach_child(Tracee *parent, word_t clone_flags, pid_t pid)
 	child->userns_left = parent->userns_left;
 	child->no_new_privs = parent->no_new_privs;
 	child->seen_execve = parent->seen_execve;
+	inherit_sigsys_action(parent, child, clone_flags);
 #ifdef HAS_POKEDATA_WORKAROUND
 	child->pokedata_workaround_stub_addr = parent->pokedata_workaround_stub_addr;
 #endif

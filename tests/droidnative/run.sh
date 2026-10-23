@@ -18,7 +18,7 @@ cc -O2 "$HERE/fuse-ro.c" $(pkg-config --cflags --libs fuse3) -o "$B/fuse-ro" || 
 export PROOT_TMP_DIR="$B/tmp"
 mkdir -p "$PROOT_TMP_DIR" "$NOEXEC"
 WORK="$(mktemp -d "$B/work.XXXXXX")"
-trap 'rm -f "${NOEXEC:?}/true" "${NOEXEC:?}/$(basename "${lib:-none}")"' EXIT
+trap 'rm -f "${NOEXEC:?}/true" "${NOEXEC:?}/pages" "${NOEXEC:?}/$(basename "${lib:-none}")"' EXIT
 PROOT="$B/proot/src/proot"
 
 fails=0
@@ -44,6 +44,12 @@ check "exec from noexec" "$(guest -b "$NOEXEC:/mnt/x" '/mnt/x/true && echo ran')
 if [ -n "$lib" ]; then
     check "library from noexec" "$(guest -b "$NOEXEC:/mnt/x" 'LD_LIBRARY_PATH=/mnt/x ls /mnt/x >/dev/null && echo ran')" "ran"
 fi
+
+# mprotect(PROT_EXEC) of written file pages (Wine's relocated PE files)
+cc -O2 "$HERE/mprotect-exec.c" -o "$B/mprotect-exec" || exit 1
+head -c 16384 /dev/zero > "$NOEXEC/pages"
+check "native mprotect exec of written pages fails" "$("$B/mprotect-exec" "$NOEXEC/pages" 2>&1)" "Permission denied"
+check "mprotect exec of written pages" "$(guest "$B/mprotect-exec $NOEXEC/pages")" "result 42 marker"
 
 # FAT-like volume
 chmod 600 "$NOEXEC/true"

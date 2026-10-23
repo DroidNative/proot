@@ -32,6 +32,25 @@ what remained were the mappings:
 
 Copies are per process and not shared between processes.
 
+### Exec of written file pages (`execmod`)
+
+Android's SELinux policy denies apps `execmod`: `mprotect(PROT_EXEC)` of
+pages of a private file mapping that were written. Wine maps PE files this
+way and relocates them in place, so without help every Wine process fails
+in `map_image_into_view` ("noexec filesystem?"). The same error comes from
+noexec mounts when a file was mapped without `PROT_EXEC` first.
+
+- seccomp traces `mprotect` only with `PROT_EXEC` (`FILTER_MPROTECT_EXEC`,
+  `syscall/seccomp.c`); `handle_mprotect_enter()` asks for the exit stage.
+- On `-EACCES`, `handle_mprotect_exit()` checks in `/proc/<pid>/maps` that
+  the range is private memory (at most 64 MiB), saves it through
+  `/proc/<pid>/mem` and chains `mmap(MAP_ANONYMOUS | MAP_FIXED)` (RW) and
+  the original `mprotect`. `dn_exec_chained_exit()` writes the saved
+  content back after the `mmap`; the tracee gets the result of the
+  `mprotect`.
+- Other threads see zeroes in the range between the `mmap` and the write;
+  programs change the protection of code they are still setting up.
+
 ## FUSE (`fuse.c`)
 
 `open("/dev/fuse")` (a placeholder bound there) becomes `socket(AF_UNIX,
@@ -82,9 +101,26 @@ Default owner is the host uid, which fake_id0 shows as the guest's user.
 - `mount(2)` emulation returns errors from these file systems.
 - Patches 0001 to 0005 of DroidNative (bubblewrap/Flatpak support, V4L2,
   memfd SysV shm, exit status, pivot_root) are part of this tree.
+- Seccomp filters of the program itself (`tracee/event.c`,
+  `tracee/seccomp.c`). PRoot used to take every seccomp SIGSYS for one
+  of Android's app filter and answer it (ENOSYS by default). A SIGSYS
+  whose `si_errno` (the filter's SECCOMP_RET_DATA) is not 0 now reaches
+  the program: Android's filter traps with 0, Chromium style sandboxes
+  (Firefox's content processes) use the handler index. Also, a trap that
+  hits while SIGSYS is blocked (new threads start with all signals
+  blocked and call `set_robust_list`, which Android traps) makes the
+  kernel reset the program's SIGSYS handler; PRoot records the handler
+  at `rt_sigaction` exit (per thread group as a fallback for threads it
+  has not linked to their parent yet) and reinstalls it with an
+  injected `rt_sigaction` before answering such a trap
+  (`restore_sigsys_action`). Without both, LibreWolf's content processes
+  crashed (SIGSEGV, later SIGSYS).
 
 ## Tests
 
-`tests/droidnative/run.sh <build dir>` builds PRoot for the PC and runs 21
+`tests/droidnative/run.sh <build dir>` builds PRoot for the PC and runs 23
 checks with the PC as guest (`-r /`). Needs a noexec tmpfs writable by the
-user (`/run/lock`), libfuse3 headers and git.
+user (`/run/lock`), libfuse3 headers and git. Further suites with the same
+argument: `binfmt.sh` (binfmt_misc emulation), `tracer.sh` (hidden
+TracerPid), `net.sh` (`/proc/net/tcp` from dn_net) and `seccomp.sh` (the
+program's own seccomp filter, `seccomp-trap.c`).

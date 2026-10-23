@@ -72,6 +72,13 @@ typedef struct {
 } Heap;
 
 /* Information related to a tracee process. */
+/* Raw kernel struct sigaction (handler, flags, restorer, mask).  */
+struct sigsys_action {
+	size_t size;
+	word_t sigsetsize;
+	unsigned char act[64];
+};
+
 typedef struct tracee {
 	/**********************************************************************
 	 * Private resources                                                  *
@@ -297,6 +304,20 @@ typedef struct tracee {
 	 * that don't support prctl(PR_GET_AUXV)). -1 when not active. */
 	int auxv_fd;
 
+	/* DroidNative: set_robust_list(2) as the tracee asked for it, kept
+	 * by PRoot where an Android app's seccomp filter traps the syscall
+	 * (tracee/seccomp.c), so get_robust_list(2) can answer.  */
+	word_t robust_head;
+	word_t robust_len;
+
+	/* DroidNative: the SIGSYS action the tracee installed, shared
+	 * like the kernel's signal handlers (CLONE_SIGHAND), and the
+	 * result to give back after PRoot reinstalled it (see
+	 * restore_sigsys_action, tracee/seccomp.c).  */
+	struct sigsys_action *sigsys;
+	bool sigsys_restoring;
+	word_t sigsys_result;
+
 	/* Guest paths of the descriptors this tracee opened with O_PATH.
 	 * mount(2) emulation needs them: bubblewrap passes "/proc/self/fd/N"
 	 * as mount source/target, and the host path of such a descriptor
@@ -424,6 +445,15 @@ typedef struct tracee {
 		/* mmap(PROT_EXEC) of a file on a noexec mount, replaced
 		 * with an anonymous mapping filled at the exit stage.  */
 		bool mmap_copy;
+
+		/* mprotect(PROT_EXEC) refused for written file pages,
+		 * redone on an anonymous copy (chained syscalls): 1 while
+		 * the mmap(2) runs, 2 while the mprotect(2) runs.  */
+		bool mprotect_exec;
+		int mprotect_copy;
+		void *mprotect_data;
+		word_t mprotect_address;
+		word_t mprotect_length;
 
 		/* open("/dev/fuse") turned into socket() + connect(),
 		 * see extension/dn_storage/fuse.c.  */

@@ -15,6 +15,12 @@
  * depends on its presented mode: always for FAT-like volumes, the
  * image's own mode for disk images, the host mode otherwise.
  *
+ * Android's SELinux policy also refuses apps "execmod": PROT_EXEC for
+ * pages of a private file mapping that were written, such as code
+ * relocated in place (Wine maps PE files like this).  Such an
+ * mprotect(2) is redone on an anonymous copy of the range, which apps
+ * may make executable.
+ *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License as
  * published by the Free Software Foundation; either version 2 of the
@@ -29,6 +35,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <linux/mman.h>
+#include <talloc.h>
 
 #include "extension/dn_storage/dn_storage.h"
 #include "syscall/sysnum.h"
@@ -171,6 +178,181 @@ static void handle_mmap_exit(Tracee *tracee)
 	force_chain_final_result(tracee, address);
 }
 
+/* mprotect(2) */
+
+/* Largest range handle_mprotect_exit() copies.  */
+#define MPROTECT_COPY_MAX (64 * 1024 * 1024)
+
+/**
+ * Whether [@start, @end) of @pid is fully covered by private mappings.
+ */
+static bool is_private_range(pid_t pid, word_t start, word_t end)
+{
+	char path[64], line[PATH_MAX + 128];
+	word_t covered = start;
+	FILE *maps;
+
+	snprintf(path, sizeof(path), "/proc/%d/maps", pid);
+	maps = fopen(path, "re");
+	if (maps == NULL)
+		return false;
+	while (covered < end && fgets(line, sizeof(line), maps) != NULL) {
+		unsigned long low, high;
+		char perms[8];
+
+		if (sscanf(line, "%lx-%lx %7s", &low, &high, perms) != 3)
+			continue;
+		if (high <= covered)
+			continue;
+		if (low > covered || perms[3] != 'p')
+			break;
+		covered = high;
+	}
+	fclose(maps);
+	return covered >= end;
+}
+
+/**
+ * Copy @length bytes between @buffer and @address of @pid through
+ * /proc/<pid>/mem, which ignores the protection of the pages.
+ */
+static int proc_mem(pid_t pid, void *buffer, word_t address, word_t length, bool write)
+{
+	char path[64];
+	word_t done = 0;
+	int fd;
+
+	snprintf(path, sizeof(path), "/proc/%d/mem", pid);
+	fd = open(path, (write ? O_WRONLY : O_RDONLY) | O_CLOEXEC);
+	if (fd < 0)
+		return -errno;
+	while (done < length) {
+		ssize_t n = write
+			? pwrite(fd, (char *) buffer + done, length - done, (off_t) (address + done))
+			: pread(fd, (char *) buffer + done, length - done, (off_t) (address + done));
+		if (n <= 0) {
+			int status = n < 0 ? -errno : -EIO;
+			close(fd);
+			return status;
+		}
+		done += n;
+	}
+	close(fd);
+	return 0;
+}
+
+static void handle_mprotect_enter(Tracee *tracee)
+{
+	if ((peek_reg(tracee, CURRENT, SYSARG_3) & PROT_EXEC) == 0)
+		return;
+	tracee->dn.mprotect_exec = true;
+	tracee->sysexit_pending = true;
+	tracee->restart_how = PTRACE_SYSCALL;
+}
+
+/**
+ * The kernel refused PROT_EXEC: when the range is private memory, put
+ * an anonymous copy in its place and try again:
+ *
+ *     mmap(address, length, PROT_READ | PROT_WRITE,
+ *          MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0)
+ *     (the saved content is written back, dn_exec_chained_exit())
+ *     mprotect(address, length, prot)
+ *
+ * Other threads of the tracee would see zeroes in between; programs
+ * change the protection of code they are still setting up.
+ */
+static void handle_mprotect_exit(Tracee *tracee)
+{
+	word_t result = peek_reg(tracee, CURRENT, SYSARG_RESULT);
+	word_t address = peek_reg(tracee, ORIGINAL, SYSARG_1);
+	word_t length = peek_reg(tracee, ORIGINAL, SYSARG_2);
+	word_t prot = peek_reg(tracee, ORIGINAL, SYSARG_3);
+	word_t page = (word_t) sysconf(_SC_PAGESIZE);
+	const word_t rw = PROT_READ | PROT_WRITE;
+	const word_t anon = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED;
+	void *data;
+	int status;
+
+	tracee->dn.mprotect_exec = false;
+
+	if ((int) result != -EACCES)
+		return;
+	length = (length + page - 1) & ~(page - 1);
+	if (length == 0 || length > MPROTECT_COPY_MAX || (address & (page - 1)) != 0)
+		return;
+	if (!is_private_range(tracee->pid, address, address + length))
+		return;
+
+	data = talloc_size(tracee, length);
+	if (data == NULL)
+		return;
+	if (proc_mem(tracee->pid, data, address, length, false) < 0) {
+		talloc_free(data);
+		return;
+	}
+
+#if defined(ARCH_X86_64) || defined(ARCH_ARM64)
+	if (!is_32on64_mode(tracee))
+		status = register_chained_syscall(tracee, PR_mmap, address, length, rw, anon, (word_t) -1, 0);
+	else
+#endif
+		status = register_chained_syscall(tracee, PR_mmap2, address, length, rw, anon, (word_t) -1, 0);
+	if (status >= 0)
+		status = register_chained_syscall(tracee, PR_mprotect, address, length, prot, 0, 0, 0);
+	if (status < 0) {
+		talloc_free(data);
+		return;
+	}
+	force_chain_final_result(tracee, 0);
+
+	tracee->dn.mprotect_copy = 1;
+	tracee->dn.mprotect_data = data;
+	tracee->dn.mprotect_address = address;
+	tracee->dn.mprotect_length = length;
+	VERBOSE(tracee, 1, "mprotect(PROT_EXEC) of written file pages at 0x%lx (%lu bytes): "
+		"using an anonymous copy", (unsigned long) address, (unsigned long) length);
+}
+
+/**
+ * Exits of the syscalls chained by handle_mprotect_exit().
+ */
+void dn_exec_chained_exit(Tracee *tracee)
+{
+	word_t result = peek_reg(tracee, CURRENT, SYSARG_RESULT);
+	int status;
+
+	switch (tracee->dn.mprotect_copy) {
+	case 1:		// mmap(2): restore the content
+		if (result == tracee->dn.mprotect_address)
+			status = proc_mem(tracee->pid, tracee->dn.mprotect_data,
+					tracee->dn.mprotect_address, tracee->dn.mprotect_length, true);
+		else
+			status = (int) result;
+		TALLOC_FREE(tracee->dn.mprotect_data);
+		if (status < 0) {
+			note(tracee, WARNING, INTERNAL,
+				"cannot copy the mapping at 0x%lx for mprotect(PROT_EXEC): %s",
+				(unsigned long) tracee->dn.mprotect_address, strerror(-status));
+			force_chain_final_result(tracee, (word_t) -EFAULT);
+			tracee->dn.mprotect_copy = 3;
+			return;
+		}
+		tracee->dn.mprotect_copy = 2;
+		return;
+
+	case 2:		// mprotect(2)
+		if ((int) result < 0)
+			force_chain_final_result(tracee, result);
+		tracee->dn.mprotect_copy = 0;
+		return;
+
+	default:	// failed copy: keep its result
+		tracee->dn.mprotect_copy = 0;
+		return;
+	}
+}
+
 /* access(2) */
 
 /**
@@ -224,6 +406,10 @@ int dn_exec_enter_end(Tracee *tracee)
 	case PR_mmap:
 	case PR_mmap2:
 		return handle_mmap_enter(tracee, sysnum);
+
+	case PR_mprotect:
+		handle_mprotect_enter(tracee);
+		return 0;
 
 	case PR_access:
 		handle_access_enter(tracee, SYSARG_1, SYSARG_2);
@@ -283,6 +469,11 @@ void dn_exec_exit_end(Tracee *tracee)
 	case PR_mmap2:
 		if (tracee->dn.mmap_copy)
 			handle_mmap_exit(tracee);
+		return;
+
+	case PR_mprotect:
+		if (tracee->dn.mprotect_exec)
+			handle_mprotect_exit(tracee);
 		return;
 
 	case PR_stat:

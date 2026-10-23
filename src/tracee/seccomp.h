@@ -20,3 +20,6 @@ void restart_syscall_after_seccomp(Tracee* tracee);
 void set_result_after_seccomp(Tracee *tracee, word_t result);
 int handle_seccomp_event(Tracee* tracee);
 void fix_and_restart_enosys_syscall(Tracee* tracee);
+bool record_sigsys_action(Tracee *tracee);
+void forget_sigsys_action(Tracee *tracee);
+void inherit_sigsys_action(Tracee *parent, Tracee *child, word_t clone_flags);

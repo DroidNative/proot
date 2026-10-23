@@ -54,6 +54,7 @@ extern mode_t dn_umask(const Tracee *tracee);
 extern bool dn_fat_path(const char *host_path);
 extern int dn_exec_enter_end(Tracee *tracee);
 extern void dn_exec_exit_end(Tracee *tracee);
+extern void dn_exec_chained_exit(Tracee *tracee);
 extern void dn_exec_statx(struct statx_syscall_state *state);
 
 /* fuse.c */

@@ -427,6 +427,10 @@ static int pre_initialize_bindings(Tracee *tracee, const Cli *cli,
 	if (getenv("PROOT_DN_VIDEO_DIR") != NULL)
 		(void) initialize_extension(tracee, dn_v4l2_callback, getenv("PROOT_DN_VIDEO_DIR"));
 
+	/* DroidNative: the guest's TCP sockets for /proc/net/tcp where
+	 * the host hides it (extension/dn_net).  */
+	(void) initialize_extension(tracee, dn_net_callback, NULL);
+
 	/* DroidNative storage, last so that it comes first in the list
 	 * of extensions (extension/dn_storage).  */
 	status = dn_storage_initialize(tracee);

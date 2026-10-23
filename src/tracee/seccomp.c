@@ -1,12 +1,16 @@
 #include <errno.h>     /* E*, */
+#include <stdio.h>     /* fopen, */
+#include <sched.h>     /* CLONE_SIGHAND, */
+#include <talloc.h>
 #include <signal.h>    /* SIGSYS, */
 #include <unistd.h>    /* getpgid, */
 #include <utime.h>     /* utimbuf, */
 #include <sys/vfs.h>   /* statfs64 */
-#include <string.h>    /* memset   */
+#include <string.h>    /* memset, memcpy, */
 #include <linux/net.h> /* SYS_SENDMMSG */
 #include <assert.h>    /* assert(3), */
 #include <time.h>      /* time(2), */
+#include <stdint.h>    /* uint32_t, */
 
 #include "extension/extension.h"
 #include "cli/note.h"
@@ -14,6 +18,7 @@
 #include "syscall/syscall.h"
 #include "tracee/seccomp.h"
 #include "tracee/mem.h"
+#include "tracee/abi.h"
 #include "tracee/statx.h"
 #include "path/path.h"
 
@@ -53,10 +58,199 @@ void restart_syscall_after_seccomp(Tracee* tracee) {
 	push_specific_regs(tracee, false);
 }
 
+/* DroidNative: the tracee's own SIGSYS handler.
+ *
+ * A seccomp trap that hits while SIGSYS is blocked, i.e. inside the
+ * tracee's SIGSYS handler, makes the kernel reset that handler to
+ * SIG_DFL (force_sig_info).  When the trap came from Android's app
+ * filter and PRoot answers it, the program never learns; the next trap
+ * of a filter it installed itself (Firefox's content sandbox) then kills
+ * it with SIGSYS.  So PRoot records the handler at rt_sigaction exit and
+ * reinstalls it before answering such a trap.  */
+
+// Reads Tgid and SigCgt from /proc/<tid>/status
+static bool read_status(pid_t tid, pid_t *tgid, unsigned long long *caught)
+{
+	char path[64], line[256];
+	int found = 0;
+	FILE *status;
+
+	snprintf(path, sizeof(path), "/proc/%d/status", tid);
+	status = fopen(path, "r");
+	if (status == NULL)
+		return false;
+	while (found < 2 && fgets(line, sizeof(line), status) != NULL) {
+		int value;
+		if (sscanf(line, "Tgid: %d", &value) == 1) {
+			*tgid = value;
+			found++;
+		} else if (sscanf(line, "SigCgt: %llx", caught) == 1) {
+			found++;
+		}
+	}
+	fclose(status);
+	return found == 2;
+}
+
+/* The last action recorded per process. A new thread can trap before
+ * PRoot has seen its parent's clone event and given it the shared record
+ * (inherit_sigsys_action), so it looks the action up here.  */
+#define SIGSYS_GROUPS 64
+static struct {
+	pid_t tgid;
+	struct sigsys_action action;
+} sigsys_groups[SIGSYS_GROUPS];
+static size_t sigsys_groups_next;
+
+static struct sigsys_action *group_action(pid_t tgid, bool create)
+{
+	size_t i;
+	for (i = 0; i < SIGSYS_GROUPS; i++)
+		if (sigsys_groups[i].tgid == tgid)
+			return &sigsys_groups[i].action;
+	if (!create)
+		return NULL;
+	i = sigsys_groups_next++ % SIGSYS_GROUPS;
+	sigsys_groups[i].tgid = tgid;
+	memset(&sigsys_groups[i].action, 0, sizeof(sigsys_groups[i].action));
+	return &sigsys_groups[i].action;
+}
+
+static word_t action_handler(const Tracee *tracee, const struct sigsys_action *a)
+{
+	word_t handler;
+	if (sizeof_word(tracee) == 4) {
+		uint32_t h32;
+		memcpy(&h32, a->act, sizeof(h32));
+		return h32;
+	}
+	memcpy(&handler, a->act, sizeof(handler));
+	return handler;
+}
+
+/**
+ * Record the action of a successful rt_sigaction(SIGSYS, act, ...), at
+ * its sysexit.  A reinstall started by restore_sigsys_action() gets its
+ * result replaced by the emulated one here.  Returns true then.
+ */
+bool record_sigsys_action(Tracee *tracee)
+{
+	word_t act = peek_reg(tracee, ORIGINAL, SYSARG_2);
+	word_t setsize = peek_reg(tracee, ORIGINAL, SYSARG_4);
+	size_t size = 3 * sizeof_word(tracee) + setsize;
+
+	if (tracee->sigsys_restoring) {
+		tracee->sigsys_restoring = false;
+		VERBOSE(tracee, 3, "SIGSYS handler reinstalled, result 0x%lx", tracee->sigsys_result);
+		poke_reg(tracee, SYSARG_RESULT, tracee->sigsys_result);
+		return true;
+	}
+	if ((int) peek_reg(tracee, ORIGINAL, SYSARG_1) != SIGSYS || act == 0
+	    || (int) peek_reg(tracee, CURRENT, SYSARG_RESULT) != 0)
+		return false;
+	if (setsize > 16 || size > sizeof(tracee->sigsys->act))
+		return false;
+	if (tracee->sigsys == NULL) {
+		tracee->sigsys = talloc_zero(tracee, struct sigsys_action);
+		if (tracee->sigsys == NULL)
+			return false;
+	}
+	if (read_data(tracee, tracee->sigsys->act, act, size) < 0) {
+		tracee->sigsys->size = 0;
+		return false;
+	}
+	tracee->sigsys->size = size;
+	tracee->sigsys->sigsetsize = setsize;
+	{
+		unsigned long long caught;
+		pid_t tgid = 0;
+		struct sigsys_action *g;
+		if (read_status(tracee->pid, &tgid, &caught) && (g = group_action(tgid, true)) != NULL)
+			*g = *tracee->sigsys;
+	}
+	return false;
+}
+
+/**
+ * An execve resets caught signals: drop the record (it may be shared with
+ * threads that are gone now).
+ */
+void forget_sigsys_action(Tracee *tracee)
+{
+	struct sigsys_action *g = group_action(tracee->pid, false);   // tid = tgid after execve
+	if (g != NULL)
+		g->size = 0;
+	if (tracee->sigsys != NULL)
+		talloc_unlink(tracee, tracee->sigsys);
+	tracee->sigsys = NULL;
+}
+
+/**
+ * Share or copy the record into a new child, as clone() does with the
+ * signal handlers.
+ */
+void inherit_sigsys_action(Tracee *parent, Tracee *child, word_t clone_flags)
+{
+	if (parent->sigsys == NULL)
+		parent->sigsys = talloc_zero(parent, struct sigsys_action);
+	if (parent->sigsys == NULL)
+		return;
+	child->sigsys = (clone_flags & CLONE_SIGHAND) != 0
+		? talloc_reference(child, parent->sigsys)
+		: talloc_memdup(child, parent->sigsys, sizeof(struct sigsys_action));
+}
+
+/* The action to reinstall when the tracee installed a SIGSYS handler that
+ * the kernel has reset, else NULL.  */
+static const struct sigsys_action *sigsys_action_lost(const Tracee *tracee)
+{
+	const struct sigsys_action *a = tracee->sigsys;
+	unsigned long long caught = 0;
+	pid_t tgid = 0;
+
+	// Nobody recorded a handler yet: no /proc read for every trap
+	if ((a == NULL || a->size == 0) && sigsys_groups_next == 0)
+		return NULL;
+	if (!read_status(tracee->pid, &tgid, &caught) || (caught & (1ULL << (SIGSYS - 1))) != 0)
+		return NULL;
+	if (a == NULL || a->size == 0)
+		a = group_action(tgid, false);
+	if (a == NULL || a->size == 0 || action_handler(tracee, a) <= 1)   // SIG_DFL, SIG_IGN
+		return NULL;
+	return a;
+}
+
+/**
+ * Turn the trapped syscall into rt_sigaction(SIGSYS, <recorded>, NULL)
+ * and restart it; record_sigsys_action() then sets @result.
+ */
+static int restore_sigsys_action(Tracee *tracee, const struct sigsys_action *a, word_t result)
+{
+	word_t sp = peek_reg(tracee, CURRENT, STACK_POINTER);
+	// Below the red zone (x86_64) and the signal frame's live data
+	word_t addr = (sp - 512 - a->size) & ~(word_t) 15;
+
+	if (write_data(tracee, addr, a->act, a->size) < 0)
+		return -1;
+	VERBOSE(tracee, 3, "reinstalling the SIGSYS handler the kernel reset");
+	set_sysnum(tracee, PR_rt_sigaction);
+	poke_reg(tracee, SYSARG_1, SIGSYS);
+	poke_reg(tracee, SYSARG_2, addr);
+	poke_reg(tracee, SYSARG_3, 0);
+	poke_reg(tracee, SYSARG_4, a->sigsetsize);
+	tracee->sigsys_result = result;
+	tracee->sigsys_restoring = true;
+	restart_syscall_after_seccomp(tracee);
+	return 0;
+}
+
 /**
  * Set specified result (negative for errno) and do not restart syscall.
  */
 void set_result_after_seccomp(Tracee *tracee, word_t result) {
+	const struct sigsys_action *lost = sigsys_action_lost(tracee);
+	if (lost != NULL && restore_sigsys_action(tracee, lost, result) == 0)
+		return;
 	VERBOSE(tracee, 3, "Setting result after SIGSYS to 0x%lx", result);
 	poke_reg(tracee, SYSARG_RESULT, result);
 	push_specific_regs(tracee, false);
@@ -649,7 +843,42 @@ static int handle_seccomp_event_common(Tracee *tracee)
 		break;
 	}
 
+	/* Android's app filter traps both; glibc does without, but
+	 * Chromium checks that a list was registered (Steam's
+	 * steamwebhelper aborts: "futex robust_list not initialized by
+	 * pthreads").  PRoot keeps the values instead: the kernel then
+	 * cannot release robust mutexes of a dying thread.  */
 	case PR_set_robust_list:
+		tracee->robust_head = peek_reg(tracee, CURRENT, SYSARG_1);
+		tracee->robust_len = peek_reg(tracee, CURRENT, SYSARG_2);
+		set_result_after_seccomp(tracee, 0);
+		break;
+
+	case PR_get_robust_list: {
+		pid_t pid = (pid_t) peek_reg(tracee, CURRENT, SYSARG_1);
+		word_t head_ptr = peek_reg(tracee, CURRENT, SYSARG_2);
+		word_t len_ptr = peek_reg(tracee, CURRENT, SYSARG_3);
+		const Tracee *target = (pid == 0 ? tracee : get_tracee(tracee, pid, false));
+		size_t size = sizeof_word(tracee);
+		word_t head, len;
+		uint32_t head32, len32;
+		int ret;
+
+		if (target == NULL) {
+			set_result_after_seccomp(tracee, -ESRCH);
+			break;
+		}
+		head = target->robust_head;
+		len = target->robust_len;
+		head32 = (uint32_t) head;
+		len32 = (uint32_t) len;
+		ret = write_data(tracee, head_ptr, size == 4 ? (void *) &head32 : (void *) &head, size);
+		if (ret == 0)
+			ret = write_data(tracee, len_ptr, size == 4 ? (void *) &len32 : (void *) &len, size);
+		set_result_after_seccomp(tracee, ret < 0 ? -EFAULT : 0);
+		break;
+	}
+
 	default:
 		/* Set errno to -ENOSYS */
 		set_result_after_seccomp(tracee, -ENOSYS);

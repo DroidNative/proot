@@ -29,6 +29,7 @@ OBJECTS += \
 	execve/enter.o		\
 	execve/exit.o		\
 	execve/shebang.o	\
+	execve/binfmt.o		\
 	execve/elf.o		\
 	execve/ldso.o		\
 	execve/auxv.o		\
@@ -62,6 +63,7 @@ OBJECTS += \
 	extension/extension.o	\
 	extension/ashmem_memfd/ashmem_memfd.o \
 	extension/dn_v4l2/dn_v4l2.o \
+	extension/dn_net/dn_net.o \
 	extension/kompat/kompat.o \
 	extension/fake_id0/chown.o \
 	extension/fake_id0/chroot.o \
@@ -186,6 +188,7 @@ build.h: $(CHECK_RESULTS)
 BUILD_ID_NONE := $(shell printf 'int main(void){return 0;}\n' | $(LD) -xc - -Wl,--build-id=none -o /dev/null >/dev/null 2>&1 && echo ',--build-id=none')
 
 # Android NDK r29+ compatibility
+IMAGE_BASE := $(shell printf 'int main(void){return 0;}\n' | $(LD) -xc - -Wl,--image-base=0x10000000 -o /dev/null >/dev/null 2>&1 && echo '--image-base=' || echo '-Ttext-segment=')
 ROSEGMENT := $(shell printf 'int main(void){return 0;}\n' | $(LD) -xc - -Wl,--rosegment -o /dev/null >/dev/null 2>&1 && echo ',--rosegment')
 
 ######################################################################
@@ -233,7 +236,12 @@ $(eval $(call define_from_arch.h,$1,LOADER_ARCH_CFLAGS))
 $(eval $(call define_from_arch.h,$1,LOADER_ADDRESS))
 
 LOADER_CFLAGS$1  += -fPIC -ffreestanding $(LOADER_ARCH_CFLAGS$1)
-LOADER_LDFLAGS$1 += -static -nostdlib -Wl$(BUILD_ID_NONE),-Ttext=$(LOADER_ADDRESS$1)$(ROSEGMENT),-z,noexecstack
+# The whole image (ELF headers included) goes to LOADER_ADDRESS: with
+# -Ttext alone, lld keeps the header segment at its default base 0x200000,
+# which non-PIE programs may need (DroidNative: Steam's steamwebhelper
+# under box64 loads there). lld spells it --image-base, GNU ld
+# -Ttext-segment.
+LOADER_LDFLAGS$1 += -static -nostdlib -Wl$(BUILD_ID_NONE),$(IMAGE_BASE)$(LOADER_ADDRESS$1)$(ROSEGMENT),-z,noexecstack
 
 loader/loader$1.o: loader/loader.c
 	@mkdir -p $$(dir $$@)

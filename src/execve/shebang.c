@@ -30,8 +30,10 @@
 #include <sys/param.h>     /* MAXSYMLINKS, */
 #include <stdbool.h>       /* bool, */
 #include <assert.h>        /* assert(3), */
+#include <string.h>        /* strcpy(3), */
 
 #include "execve/shebang.h"
+#include "execve/binfmt.h"
 #include "execve/execve.h"
 #include "execve/aoxp.h"
 #include "tracee/tracee.h"
@@ -246,9 +248,38 @@ int expand_shebang(Tracee *tracee, char host_path[PATH_MAX], char user_path[PATH
 		if (status < 0)
 			return status;
 
-		/* No more shebang.  */
-		if (status == 0)
+		/* No more shebang: a binfmt rule may still name an
+		 * interpreter (execve/binfmt.c).  It is resolved there,
+		 * and it is a native program, so the expansion ends.  */
+		if (status == 0) {
+			char interp_host[PATH_MAX];
+
+			status = binfmt_lookup(tracee, host_path, old_user_path, user_path, interp_host);
+			if (status < 0)
+				return status;
+			if (status == 0)
+				break;
+
+			if (argv == NULL) {
+				status = fetch_array_of_xpointers(tracee, &argv, SYSARG_2, 0);
+				if (status < 0)
+					return status;
+			}
+
+			/* execve("/x86/prog", { "prog", "-a", NULL }, ...)
+			 * becomes execve("/usr/bin/box64",
+			 *     { "/usr/bin/box64", "/x86/prog", "-a", NULL }, ...)  */
+			status = resize_array_of_xpointers(argv, 0, 1 + (argv->length == 1));
+			if (status < 0)
+				return status;
+			status = write_xpointees(argv, 0, 2, user_path, old_user_path);
+			if (status < 0)
+				return status;
+
+			strcpy(host_path, interp_host);
+			has_shebang = true;
 			break;
+		}
 		has_shebang = true;
 
 		/* Translate new path (user -> host), then check it is executable.  */

@@ -233,6 +233,7 @@ pid_t dn_storage_waitpid(int *status)
 static FilteredSysnum filtered_sysnums[] = {
 	{ PR_mmap,		FILTER_PROT_EXEC },
 	{ PR_mmap2,		FILTER_PROT_EXEC },
+	{ PR_mprotect,		FILTER_MPROTECT_EXEC },
 	{ PR_fchmod,		0 },
 	{ PR_fchown,		0 },
 	{ PR_fchown32,		0 },
@@ -310,6 +311,8 @@ static int dn_storage_callback(Extension *extension, ExtensionEvent event,
 		tracee = TRACEE(extension);
 		if (tracee->dn.fuse_open != 0)
 			dn_fuse_chained_exit(tracee);
+		if (tracee->dn.mprotect_copy != 0)
+			dn_exec_chained_exit(tracee);
 		return 0;
 
 	case STATX_SYSCALL:

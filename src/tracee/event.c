@@ -898,6 +898,18 @@ int handle_tracee_event(Tracee *tracee, int tracee_status)
 					tracee->skip_next_seccomp_signal = false;
 					tracee->restore_sysarg1_after_sigsys = false;
 					signal = 0;
+				} else if (siginfo.si_errno != 0) {
+					/* si_errno is the filter's SECCOMP_RET_DATA.
+					 * Android's app filter traps with 0; a
+					 * non-zero value comes from a filter the
+					 * program installed itself and handles in
+					 * its own SIGSYS handler (Chromium style
+					 * sandboxes, as in Firefox's content
+					 * processes, use it as handler index), so it
+					 * must reach the program untouched.  */
+					VERBOSE(tracee, 4, "SIGSYS from the tracee's own filter (data %d)",
+						siginfo.si_errno);
+					tracee->restore_sysarg1_after_sigsys = false;
 				} else {
 					signal = handle_seccomp_event(tracee);
 				}

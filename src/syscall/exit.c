@@ -533,7 +533,13 @@ void translate_syscall_exit(Tracee *tracee)
 
 	case PR_execve:
 	case PR_execveat:
+		if ((int) syscall_result == 0)
+			forget_sigsys_action(tracee);
 		translate_execve_exit(tracee);
+		goto end;
+
+	case PR_rt_sigaction:
+		record_sigsys_action(tracee);
 		goto end;
 
 	case PR_openat2:

@@ -95,7 +95,11 @@ static int add_statements(struct sock_fprog *program, size_t nb_statements,
  */
 static size_t length_trace_syscall(int flag)
 {
-	return (flag & FILTER_PROT_EXEC) != 0 ? 7 : 2;
+	if ((flag & FILTER_PROT_EXEC) != 0)
+		return 7;
+	if ((flag & FILTER_MPROTECT_EXEC) != 0)
+		return 5;
+	return 2;
 }
 
 /**
@@ -136,10 +140,22 @@ static int add_trace_syscall(struct sock_fprog *program, word_t syscall, int fla
 		BPF_STMT(BPF_RET + BPF_K, SECCOMP_RET_ALLOW),
 	};
 
+	/* mprotect(addr, length, prot): only requests for PROT_EXEC
+	 * (exec of written file pages, see extension/dn_storage).  */
+	struct sock_filter mprotect_exec[5] = {
+		BPF_JUMP(BPF_JMP + BPF_JEQ + BPF_K, syscall, 0, 4),
+		BPF_STMT(BPF_LD + BPF_W + BPF_ABS, args_offset + 2 * sizeof(uint64_t)),
+		BPF_JUMP(BPF_JMP + BPF_JSET + BPF_K, PROT_EXEC, 0, 1),
+		BPF_STMT(BPF_RET + BPF_K, SECCOMP_RET_TRACE + flag),
+		BPF_STMT(BPF_RET + BPF_K, SECCOMP_RET_ALLOW),
+	};
+
 	DEBUG_FILTER("FILTER:     trace if syscall == %ld\n", syscall);
 
 	if ((flag & FILTER_PROT_EXEC) != 0)
 		status = add_statements(program, 7, prot_exec);
+	else if ((flag & FILTER_MPROTECT_EXEC) != 0)
+		status = add_statements(program, 5, mprotect_exec);
 	else
 		status = add_statements(program, 2, statements);
 	if (status < 0)
@@ -377,6 +393,7 @@ static FilteredSysnum proot_sysnums[] = {
 	{ PR_sendto,		0 },
 	{ PR_socket,		FILTER_SYSEXIT },
 	{ PR_execve,		FILTER_SYSEXIT },
+	{ PR_rt_sigaction,	FILTER_SYSEXIT },
 	{ PR_execveat,		FILTER_SYSEXIT },
 	{ PR_faccessat,		0 },
 	{ PR_faccessat2,	FILTER_SYSEXIT },
@@ -508,10 +525,10 @@ static int merge_filtered_sysnums(TALLOC_CTX *context, FilteredSysnum **sysnums,
 		}
 		else {
 			/* The sysnum is already filtered, merge the
-			 * flags.  A full trace wins over FILTER_PROT_EXEC.  */
+			 * flags.  A full trace wins over an argument filter.  */
 			int merged = (*sysnums)[j].flags | new_sysnums[i].flags;
-			if ((((*sysnums)[j].flags ^ new_sysnums[i].flags) & FILTER_PROT_EXEC) != 0)
-				merged &= ~FILTER_PROT_EXEC;
+			if ((((*sysnums)[j].flags ^ new_sysnums[i].flags) & FILTER_ARGS) != 0)
+				merged &= ~FILTER_ARGS;
 			(*sysnums)[j].flags = merged;
 		}
 	}
